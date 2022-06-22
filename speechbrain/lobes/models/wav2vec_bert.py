@@ -1,12 +1,56 @@
 import math
+from typing import Tuple, List
+import numpy as np
+import torch
 import torch.nn as nn
-from typing import Tuple, List, Literal
+import torch.nn.functional as F
 
 FEATURE_ENC_LAYERS: List[Tuple[int, int, int]] = (
     [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] + [(512, 2, 2)]
 )
 
 # based on https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/wav2vec/wav2vec2.py
+
+
+def is_xla_tensor(tensor):
+    return torch.is_tensor(tensor) and tensor.device.type == "xla"
+
+
+def index_put(tensor, indices, value):
+    if is_xla_tensor(tensor):
+        for _ in range(indices.dim(), tensor.dim()):
+            indices = indices.unsqueeze(-1)
+        if indices.size(-1) < tensor.size(-1):
+            indices = indices.expand_as(tensor)
+        tensor = torch.mul(tensor, ~indices) + torch.mul(value, indices)
+    else:
+        tensor[indices] = value
+    return tensor
+
+
+def buffered_arange(max):
+    if not hasattr(buffered_arange, "buf"):
+        buffered_arange.buf = torch.LongTensor()
+    if max > buffered_arange.buf.numel():
+        buffered_arange.buf.resize_(max)
+        torch.arange(max, out=buffered_arange.buf)
+    return buffered_arange.buf[:max]
+
+
+def pad_to_multiple(x, multiple, dim=-1, value=0):
+    # Inspired from https://github.com/lucidrains/local-attention/blob/master/local_attention/local_attention.py#L41
+    if x is None:
+        return None, 0
+    tsz = x.size(dim)
+    m = tsz / multiple
+    remainder = math.ceil(m) * multiple - tsz
+    if m.is_integer():
+        return x, 0
+    pad_offset = (0,) * (-1 - dim) * 2
+
+    return F.pad(x, (*pad_offset, 0, remainder), value=value), remainder
+
+
 class Wav2Vec2(nn.Module):
     """"""
 
@@ -23,7 +67,7 @@ class Wav2Vec2(nn.Module):
 
         self.embed = feature_enc_layers[-1][0]
         self.conv_bias = conv_bias
-        self.extractor_mode = extractor_mode
+        # self.extractor_mode = extractor_mode
         self.dropout = dropout
 
         self.feature_extractor = ConvFeatureExtractionModel(
@@ -32,178 +76,174 @@ class Wav2Vec2(nn.Module):
             conv_bias=self.conv_bias,
         )
 
-        self.post_extract_proj = (
-            nn.Linear(self.embed, cfg.encoder_embed_dim)
-            if self.embed != cfg.encoder_embed_dim and not cfg.quantize_input
-            else None
-        )
+        # self.post_extract_proj = (
+        #     nn.Linear(self.embed, cfg.encoder_embed_dim)
+        #     if self.embed != cfg.encoder_embed_dim and not cfg.quantize_input
+        #     else None
+        # )
 
-        self.crop_seq_to_multiple = cfg.crop_seq_to_multiple
+        # self.crop_seq_to_multiple = cfg.crop_seq_to_multiple
 
-        self.mask_prob = cfg.mask_prob
-        self.mask_selection = cfg.mask_selection
-        self.mask_other = cfg.mask_other
-        self.mask_length = cfg.mask_length
-        self.no_mask_overlap = cfg.no_mask_overlap
-        self.mask_min_space = cfg.mask_min_space
+        # self.mask_prob = cfg.mask_prob
+        # self.mask_selection = cfg.mask_selection
+        # self.mask_other = cfg.mask_other
+        # self.mask_length = cfg.mask_length
+        # self.no_mask_overlap = cfg.no_mask_overlap
+        # self.mask_min_space = cfg.mask_min_space
 
-        self.mask_channel_prob = cfg.mask_channel_prob
-        self.mask_channel_before = cfg.mask_channel_before
-        self.mask_channel_selection = cfg.mask_channel_selection
-        self.mask_channel_other = cfg.mask_channel_other
-        self.mask_channel_length = cfg.mask_channel_length
-        self.no_mask_channel_overlap = cfg.no_mask_channel_overlap
-        self.mask_channel_min_space = cfg.mask_channel_min_space
+        # self.mask_channel_prob = cfg.mask_channel_prob
+        # self.mask_channel_before = cfg.mask_channel_before
+        # self.mask_channel_selection = cfg.mask_channel_selection
+        # self.mask_channel_other = cfg.mask_channel_other
+        # self.mask_channel_length = cfg.mask_channel_length
+        # self.no_mask_channel_overlap = cfg.no_mask_channel_overlap
+        # self.mask_channel_min_space = cfg.mask_channel_min_space
 
-        self.dropout_input = nn.Dropout(cfg.dropout_input)
-        self.dropout_features = nn.Dropout(cfg.dropout_features)
+        # self.dropout_input = nn.Dropout(cfg.dropout_input)
+        # self.dropout_features = nn.Dropout(cfg.dropout_features)
 
-        self.feature_grad_mult = cfg.feature_grad_mult
+        # self.feature_grad_mult = cfg.feature_grad_mult
 
-        self.quantizer = None
-        self.input_quantizer = None
+        # self.quantizer = None
+        # self.input_quantizer = None
 
-        self.n_negatives = cfg.num_negatives
-        self.cross_sample_negatives = cfg.cross_sample_negatives
-        self.codebook_negatives = cfg.codebook_negatives
-        self.negatives_from_everywhere = cfg.negatives_from_everywhere
+        # self.n_negatives = cfg.num_negatives
+        # self.cross_sample_negatives = cfg.cross_sample_negatives
+        # self.codebook_negatives = cfg.codebook_negatives
+        # self.negatives_from_everywhere = cfg.negatives_from_everywhere
 
-        self.logit_temp = cfg.logit_temp
+        # self.logit_temp = cfg.logit_temp
 
-        final_dim = (
-            cfg.final_dim if cfg.final_dim > 0 else cfg.encoder_embed_dim
-        )
+        # final_dim = (
+        #     cfg.final_dim if cfg.final_dim > 0 else cfg.encoder_embed_dim
+        # )
 
-        if cfg.quantize_targets:
-            vq_dim = cfg.latent_dim if cfg.latent_dim > 0 else final_dim
-            self.quantizer = GumbelVectorQuantizer(
-                dim=self.embed,
-                num_vars=cfg.latent_vars,
-                temp=cfg.latent_temp,
-                groups=cfg.latent_groups,
-                combine_groups=False,
-                vq_dim=vq_dim,
-                time_first=True,
-                weight_proj_depth=cfg.quantizer_depth,
-                weight_proj_factor=cfg.quantizer_factor,
-            )
-            self.project_q = nn.Linear(vq_dim, final_dim)
-        else:
-            self.project_q = nn.Linear(self.embed, final_dim)
+        # if cfg.quantize_targets:
+        #     vq_dim = cfg.latent_dim if cfg.latent_dim > 0 else final_dim
+        #     self.quantizer = GumbelVectorQuantizer(
+        #         dim=self.embed,
+        #         num_vars=cfg.latent_vars,
+        #         temp=cfg.latent_temp,
+        #         groups=cfg.latent_groups,
+        #         combine_groups=False,
+        #         vq_dim=vq_dim,
+        #         time_first=True,
+        #         weight_proj_depth=cfg.quantizer_depth,
+        #         weight_proj_factor=cfg.quantizer_factor,
+        #     )
+        #     self.project_q = nn.Linear(vq_dim, final_dim)
+        # else:
+        #     self.project_q = nn.Linear(self.embed, final_dim)
 
-        if cfg.quantize_input:
-            if cfg.same_quantizer and self.quantizer is not None:
-                vq_dim = final_dim
-                self.input_quantizer = self.quantizer
-            else:
-                vq_dim = (
-                    cfg.latent_dim
-                    if cfg.latent_dim > 0
-                    else cfg.encoder_embed_dim
-                )
-                self.input_quantizer = GumbelVectorQuantizer(
-                    dim=self.embed,
-                    num_vars=cfg.latent_vars,
-                    temp=cfg.latent_temp,
-                    groups=cfg.latent_groups,
-                    combine_groups=False,
-                    vq_dim=vq_dim,
-                    time_first=True,
-                    weight_proj_depth=cfg.quantizer_depth,
-                    weight_proj_factor=cfg.quantizer_factor,
-                )
-            self.project_inp = nn.Linear(vq_dim, cfg.encoder_embed_dim)
+        # if cfg.quantize_input:
+        #     if cfg.same_quantizer and self.quantizer is not None:
+        #         vq_dim = final_dim
+        #         self.input_quantizer = self.quantizer
+        #     else:
+        #         vq_dim = (
+        #             cfg.latent_dim
+        #             if cfg.latent_dim > 0
+        #             else cfg.encoder_embed_dim
+        #         )
+        #         self.input_quantizer = GumbelVectorQuantizer(
+        #             dim=self.embed,
+        #             num_vars=cfg.latent_vars,
+        #             temp=cfg.latent_temp,
+        #             groups=cfg.latent_groups,
+        #             combine_groups=False,
+        #             vq_dim=vq_dim,
+        #             time_first=True,
+        #             weight_proj_depth=cfg.quantizer_depth,
+        #             weight_proj_factor=cfg.quantizer_factor,
+        #         )
+        #     self.project_inp = nn.Linear(vq_dim, cfg.encoder_embed_dim)
 
-        self.mask_emb = nn.Parameter(
-            torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
-        )
-        encoder_cls = TransformerEncoder
-        if cfg.layer_type == "conformer" and cfg.pos_enc_type in [
-            "rel_pos",
-            "rope",
-        ]:
-            encoder_cls = ConformerEncoder
+        # self.mask_emb = nn.Parameter(
+        #     torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
+        # )
+        # encoder_cls = TransformerEncoder
+        # if cfg.layer_type == "conformer" and cfg.pos_enc_type in [
+        #     "rel_pos",
+        #     "rope",
+        # ]:
+        #     encoder_cls = ConformerEncoder
 
-        self.encoder = encoder_cls(cfg)
-        self.layer_norm = LayerNorm(self.embed)
+        # self.encoder = encoder_cls(cfg)
+        # self.layer_norm = LayerNorm(self.embed)
 
-        self.target_glu = None
-        if cfg.target_glu:
-            self.target_glu = nn.Sequential(
-                nn.Linear(final_dim, final_dim * 2), nn.GLU()
-            )
+        # self.target_glu = None
+        # if cfg.target_glu:
+        #     self.target_glu = nn.Sequential(
+        #         nn.Linear(final_dim, final_dim * 2), nn.GLU()
+        #     )
 
-        self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
+        # self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
 
     def apply_mask(
-        self,
-        x,
-        padding_mask,
-        mask_indices=None,
-        mask_channel_indices=None,
+        self, x, padding_mask, mask_indices=None, mask_channel_indices=None,
     ):
         B, T, C = x.shape
 
-        if self.mask_channel_prob > 0 and self.mask_channel_before:
-            mask_channel_indices = compute_mask_indices(
-                (B, C),
-                None,
-                self.mask_channel_prob,
-                self.mask_channel_length,
-                self.mask_channel_selection,
-                self.mask_channel_other,
-                no_overlap=self.no_mask_channel_overlap,
-                min_space=self.mask_channel_min_space,
-            )
-            mask_channel_indices = (
-                torch.from_numpy(mask_channel_indices)
-                .to(x.device)
-                .unsqueeze(1)
-                .expand(-1, T, -1)
-            )
-            x[mask_channel_indices] = 0
+        # if self.mask_channel_prob > 0 and self.mask_channel_before:
+        #     mask_channel_indices = compute_mask_indices(
+        #         (B, C),
+        #         None,
+        #         self.mask_channel_prob,
+        #         self.mask_channel_length,
+        #         self.mask_channel_selection,
+        #         self.mask_channel_other,
+        #         no_overlap=self.no_mask_channel_overlap,
+        #         min_space=self.mask_channel_min_space,
+        #     )
+        #     mask_channel_indices = (
+        #         torch.from_numpy(mask_channel_indices)
+        #         .to(x.device)
+        #         .unsqueeze(1)
+        #         .expand(-1, T, -1)
+        #     )
+        #     x[mask_channel_indices] = 0
 
-        if self.mask_prob > 0:
-            if mask_indices is None:
-                mask_indices = compute_mask_indices(
-                    (B, T),
-                    padding_mask,
-                    self.mask_prob,
-                    self.mask_length,
-                    self.mask_selection,
-                    self.mask_other,
-                    min_masks=2,
-                    no_overlap=self.no_mask_overlap,
-                    min_space=self.mask_min_space,
-                    require_same_masks=self.cfg.require_same_masks,
-                    mask_dropout=self.cfg.mask_dropout,
-                )
-                mask_indices = torch.from_numpy(mask_indices).to(x.device)
-            x = index_put(x, mask_indices, self.mask_emb)
-        else:
-            mask_indices = None
+        # if self.mask_prob > 0:
+        #     if mask_indices is None:
+        #         mask_indices = compute_mask_indices(
+        #             (B, T),
+        #             padding_mask,
+        #             self.mask_prob,
+        #             self.mask_length,
+        #             self.mask_selection,
+        #             self.mask_other,
+        #             min_masks=2,
+        #             no_overlap=self.no_mask_overlap,
+        #             min_space=self.mask_min_space,
+        #             require_same_masks=self.cfg.require_same_masks,
+        #             mask_dropout=self.cfg.mask_dropout,
+        #         )
+        #         mask_indices = torch.from_numpy(mask_indices).to(x.device)
+        #     x = index_put(x, mask_indices, self.mask_emb)
+        # else:
+        #     mask_indices = None
 
-        if self.mask_channel_prob > 0 and not self.mask_channel_before:
-            if mask_channel_indices is None:
-                mask_channel_indices = compute_mask_indices(
-                    (B, C),
-                    None,
-                    self.mask_channel_prob,
-                    self.mask_channel_length,
-                    self.mask_channel_selection,
-                    self.mask_channel_other,
-                    no_overlap=self.no_mask_channel_overlap,
-                    min_space=self.mask_channel_min_space,
-                )
-                mask_channel_indices = (
-                    torch.from_numpy(mask_channel_indices)
-                    .to(x.device)
-                    .unsqueeze(1)
-                    .expand(-1, T, -1)
-                )
-            x = index_put(x, mask_channel_indices, 0)
+        # if self.mask_channel_prob > 0 and not self.mask_channel_before:
+        #     if mask_channel_indices is None:
+        #         mask_channel_indices = compute_mask_indices(
+        #             (B, C),
+        #             None,
+        #             self.mask_channel_prob,
+        #             self.mask_channel_length,
+        #             self.mask_channel_selection,
+        #             self.mask_channel_other,
+        #             no_overlap=self.no_mask_channel_overlap,
+        #             min_space=self.mask_channel_min_space,
+        #         )
+        #         mask_channel_indices = (
+        #             torch.from_numpy(mask_channel_indices)
+        #             .to(x.device)
+        #             .unsqueeze(1)
+        #             .expand(-1, T, -1)
+        #         )
+        #     x = index_put(x, mask_channel_indices, 0)
 
-        return x, mask_indices
+        # return x, mask_indices
 
     def sample_negatives(self, y, num, padding_count=None):
 
@@ -285,9 +325,7 @@ class Wav2Vec2(nn.Module):
 
         return logits
 
-    def _get_feat_extract_output_lengths(
-        self, input_lengths: torch.LongTensor
-    ):
+    def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """
         Computes the output length of the convolutional layers
         """
@@ -315,193 +353,192 @@ class Wav2Vec2(nn.Module):
         mask_channel_indices=None,
         padding_count=None,
     ):
+        ...
+        # if self.feature_grad_mult > 0:
+        #     features = self.feature_extractor(source)
+        #     if self.feature_grad_mult != 1.0:
+        #         features = GradMultiply.apply(features, self.feature_grad_mult)
+        # else:
+        #     with torch.no_grad():
+        #         features = self.feature_extractor(source)
 
-        if self.feature_grad_mult > 0:
-            features = self.feature_extractor(source)
-            if self.feature_grad_mult != 1.0:
-                features = GradMultiply.apply(features, self.feature_grad_mult)
-        else:
-            with torch.no_grad():
-                features = self.feature_extractor(source)
+        # features_pen = features.float().pow(2).mean()
 
-        features_pen = features.float().pow(2).mean()
+        # features = features.transpose(1, 2)
+        # features = self.layer_norm(features)
+        # unmasked_features = features.clone()
 
-        features = features.transpose(1, 2)
-        features = self.layer_norm(features)
-        unmasked_features = features.clone()
+        # if padding_mask is not None and padding_mask.any():
+        #     input_lengths = (1 - padding_mask.long()).sum(-1)
+        #     # apply conv formula to get real output_lengths
+        #     output_lengths = self._get_feat_extract_output_lengths(
+        #         input_lengths
+        #     )
 
-        if padding_mask is not None and padding_mask.any():
-            input_lengths = (1 - padding_mask.long()).sum(-1)
-            # apply conv formula to get real output_lengths
-            output_lengths = self._get_feat_extract_output_lengths(
-                input_lengths
-            )
+        #     padding_mask = torch.zeros(
+        #         features.shape[:2],
+        #         dtype=features.dtype,
+        #         device=features.device,
+        #     )
 
-            padding_mask = torch.zeros(
-                features.shape[:2],
-                dtype=features.dtype,
-                device=features.device,
-            )
+        #     # these two operations makes sure that all values
+        #     # before the output lengths indices are attended to
+        #     padding_mask[
+        #         (
+        #             torch.arange(
+        #                 padding_mask.shape[0], device=padding_mask.device
+        #             ),
+        #             output_lengths - 1,
+        #         )
+        #     ] = 1
+        #     padding_mask = (
+        #         1 - padding_mask.flip([-1]).cumsum(-1).flip([-1])
+        #     ).bool()
+        # else:
+        #     padding_mask = None
 
-            # these two operations makes sure that all values
-            # before the output lengths indices are attended to
-            padding_mask[
-                (
-                    torch.arange(
-                        padding_mask.shape[0], device=padding_mask.device
-                    ),
-                    output_lengths - 1,
-                )
-            ] = 1
-            padding_mask = (
-                1 - padding_mask.flip([-1]).cumsum(-1).flip([-1])
-            ).bool()
-        else:
-            padding_mask = None
+        # time_steps_to_drop = features.size(1) % self.crop_seq_to_multiple
+        # if time_steps_to_drop != 0:
+        #     features = features[:, :-time_steps_to_drop]
+        #     unmasked_features = unmasked_features[:, :-time_steps_to_drop]
+        #     if padding_mask is not None:
+        #         padding_mask = padding_mask[:, :-time_steps_to_drop]
+        # if self.post_extract_proj is not None:
+        #     features = self.post_extract_proj(features)
 
-        time_steps_to_drop = features.size(1) % self.crop_seq_to_multiple
-        if time_steps_to_drop != 0:
-            features = features[:, :-time_steps_to_drop]
-            unmasked_features = unmasked_features[:, :-time_steps_to_drop]
-            if padding_mask is not None:
-                padding_mask = padding_mask[:, :-time_steps_to_drop]
+        # features = self.dropout_input(features)
+        # unmasked_features = self.dropout_features(unmasked_features)
 
-        if self.post_extract_proj is not None:
-            features = self.post_extract_proj(features)
+        # num_vars = None
+        # code_ppl = None
+        # prob_ppl = None
+        # curr_temp = None
 
-        features = self.dropout_input(features)
-        unmasked_features = self.dropout_features(unmasked_features)
+        # if self.input_quantizer:
+        #     q = self.input_quantizer(features, produce_targets=False)
+        #     features = q["x"]
+        #     num_vars = q["num_vars"]
+        #     code_ppl = q["code_perplexity"]
+        #     prob_ppl = q["prob_perplexity"]
+        #     curr_temp = q["temp"]
+        #     features = self.project_inp(features)
 
-        num_vars = None
-        code_ppl = None
-        prob_ppl = None
-        curr_temp = None
+        # if mask:
+        #     x, mask_indices = self.apply_mask(
+        #         features,
+        #         padding_mask,
+        #         mask_indices=mask_indices,
+        #         mask_channel_indices=mask_channel_indices,
+        #     )
+        #     if not is_xla_tensor(x) and mask_indices is not None:
+        #         # tpu-comment: reducing the size in a dynamic way causes
+        #         # too many recompilations on xla.
+        #         y = unmasked_features[mask_indices].view(
+        #             unmasked_features.size(0), -1, unmasked_features.size(-1)
+        #         )
+        #     else:
+        #         y = unmasked_features
+        # else:
+        #     x = features
+        #     y = unmasked_features
+        #     mask_indices = None
 
-        if self.input_quantizer:
-            q = self.input_quantizer(features, produce_targets=False)
-            features = q["x"]
-            num_vars = q["num_vars"]
-            code_ppl = q["code_perplexity"]
-            prob_ppl = q["prob_perplexity"]
-            curr_temp = q["temp"]
-            features = self.project_inp(features)
+        # x, layer_results = self.encoder(
+        #     x, padding_mask=padding_mask, layer=layer
+        # )
 
-        if mask:
-            x, mask_indices = self.apply_mask(
-                features,
-                padding_mask,
-                mask_indices=mask_indices,
-                mask_channel_indices=mask_channel_indices,
-            )
-            if not is_xla_tensor(x) and mask_indices is not None:
-                # tpu-comment: reducing the size in a dynamic way causes
-                # too many recompilations on xla.
-                y = unmasked_features[mask_indices].view(
-                    unmasked_features.size(0), -1, unmasked_features.size(-1)
-                )
-            else:
-                y = unmasked_features
-        else:
-            x = features
-            y = unmasked_features
-            mask_indices = None
+        # if features_only:
+        #     return {
+        #         "x": x,
+        #         "padding_mask": padding_mask,
+        #         "features": unmasked_features,
+        #         "layer_results": layer_results,
+        #     }
 
-        x, layer_results = self.encoder(
-            x, padding_mask=padding_mask, layer=layer
-        )
+        # if self.quantizer:
+        #     if self.negatives_from_everywhere:
+        #         q = self.quantizer(unmasked_features, produce_targets=False)
+        #         y = q["x"]
+        #         num_vars = q["num_vars"]
+        #         code_ppl = q["code_perplexity"]
+        #         prob_ppl = q["prob_perplexity"]
+        #         curr_temp = q["temp"]
+        #         y = self.project_q(y)
 
-        if features_only:
-            return {
-                "x": x,
-                "padding_mask": padding_mask,
-                "features": unmasked_features,
-                "layer_results": layer_results,
-            }
+        #         negs, _ = self.sample_negatives(
+        #             y,
+        #             mask_indices[0].sum(),
+        #             padding_count=padding_count,
+        #         )
+        #         y = y[mask_indices].view(y.size(0), -1, y.size(-1))
 
-        if self.quantizer:
-            if self.negatives_from_everywhere:
-                q = self.quantizer(unmasked_features, produce_targets=False)
-                y = q["x"]
-                num_vars = q["num_vars"]
-                code_ppl = q["code_perplexity"]
-                prob_ppl = q["prob_perplexity"]
-                curr_temp = q["temp"]
-                y = self.project_q(y)
+        #     else:
+        #         q = self.quantizer(y, produce_targets=False)
+        #         y = q["x"]
+        #         num_vars = q["num_vars"]
+        #         code_ppl = q["code_perplexity"]
+        #         prob_ppl = q["prob_perplexity"]
+        #         curr_temp = q["temp"]
 
-                negs, _ = self.sample_negatives(
-                    y,
-                    mask_indices[0].sum(),
-                    padding_count=padding_count,
-                )
-                y = y[mask_indices].view(y.size(0), -1, y.size(-1))
+        #         y = self.project_q(y)
 
-            else:
-                q = self.quantizer(y, produce_targets=False)
-                y = q["x"]
-                num_vars = q["num_vars"]
-                code_ppl = q["code_perplexity"]
-                prob_ppl = q["prob_perplexity"]
-                curr_temp = q["temp"]
+        #         negs, _ = self.sample_negatives(
+        #             y,
+        #             y.size(1),
+        #             padding_count=padding_count,
+        #         )
 
-                y = self.project_q(y)
+        #     if self.codebook_negatives > 0:
+        #         cb_negs = self.quantizer.sample_from_codebook(
+        #             y.size(0) * y.size(1), self.codebook_negatives
+        #         )
+        #         cb_negs = cb_negs.view(
+        #             self.codebook_negatives, y.size(0), y.size(1), -1
+        #         )  # order doesnt matter
+        #         cb_negs = self.project_q(cb_negs)
+        #         negs = torch.cat([negs, cb_negs], dim=0)
+        # else:
+        #     y = self.project_q(y)
 
-                negs, _ = self.sample_negatives(
-                    y,
-                    y.size(1),
-                    padding_count=padding_count,
-                )
+        #     if self.negatives_from_everywhere:
+        #         negs, _ = self.sample_negatives(
+        #             unmasked_features,
+        #             y.size(1),
+        #             padding_count=padding_count,
+        #         )
+        #         negs = self.project_q(negs)
+        #     else:
+        #         negs, _ = self.sample_negatives(
+        #             y,
+        #             y.size(1),
+        #             padding_count=padding_count,
+        #         )
 
-            if self.codebook_negatives > 0:
-                cb_negs = self.quantizer.sample_from_codebook(
-                    y.size(0) * y.size(1), self.codebook_negatives
-                )
-                cb_negs = cb_negs.view(
-                    self.codebook_negatives, y.size(0), y.size(1), -1
-                )  # order doesnt matter
-                cb_negs = self.project_q(cb_negs)
-                negs = torch.cat([negs, cb_negs], dim=0)
-        else:
-            y = self.project_q(y)
+        # if not is_xla_tensor(x):
+        #     # tpu-comment: reducing the size in a dynamic way causes
+        #     # too many recompilations on xla.
+        #     x = x[mask_indices].view(x.size(0), -1, x.size(-1))
 
-            if self.negatives_from_everywhere:
-                negs, _ = self.sample_negatives(
-                    unmasked_features,
-                    y.size(1),
-                    padding_count=padding_count,
-                )
-                negs = self.project_q(negs)
-            else:
-                negs, _ = self.sample_negatives(
-                    y,
-                    y.size(1),
-                    padding_count=padding_count,
-                )
+        # if self.target_glu:
+        #     y = self.target_glu(y)
+        #     negs = self.target_glu(negs)
 
-        if not is_xla_tensor(x):
-            # tpu-comment: reducing the size in a dynamic way causes
-            # too many recompilations on xla.
-            x = x[mask_indices].view(x.size(0), -1, x.size(-1))
+        # x = self.final_proj(x)
+        # x = self.compute_preds(x, y, negs)
 
-        if self.target_glu:
-            y = self.target_glu(y)
-            negs = self.target_glu(negs)
+        # result = {
+        #     "x": x,
+        #     "padding_mask": padding_mask,
+        #     "features_pen": features_pen,
+        # }
 
-        x = self.final_proj(x)
-        x = self.compute_preds(x, y, negs)
+        # if prob_ppl is not None:
+        #     result["prob_perplexity"] = prob_ppl
+        #     result["code_perplexity"] = code_ppl
+        #     result["num_vars"] = num_vars
+        #     result["temp"] = curr_temp
 
-        result = {
-            "x": x,
-            "padding_mask": padding_mask,
-            "features_pen": features_pen,
-        }
-
-        if prob_ppl is not None:
-            result["prob_perplexity"] = prob_ppl
-            result["code_perplexity"] = code_ppl
-            result["num_vars"] = num_vars
-            result["temp"] = curr_temp
-
-        return result
+        # return result
 
     def quantize(self, x):
         assert self.quantizer is not None
@@ -594,109 +631,105 @@ class ConvFeatureExtractionModel(nn.Module):
 
 
 def make_conv_pos(e, k, g):
-    pos_conv = nn.Conv1d(
-        e,
-        e,
-        kernel_size=k,
-        padding=k // 2,
-        groups=g,
-    )
+    pos_conv = nn.Conv1d(e, e, kernel_size=k, padding=k // 2, groups=g,)
     dropout = 0
     std = math.sqrt((4 * (1.0 - dropout)) / (k * e))
     nn.init.normal_(pos_conv.weight, mean=0, std=std)
     nn.init.constant_(pos_conv.bias, 0)
 
     pos_conv = nn.utils.weight_norm(pos_conv, name="weight", dim=2)
-    pos_conv = nn.Sequential(pos_conv, SamePad(k), nn.GELU())
+    # TODO Need to implement SamePad
+    # pos_conv = nn.Sequential(pos_conv, SamePad(k), nn.GELU())
 
     return pos_conv
 
 
 class TransformerEncoder(nn.Module):
-    def build_encoder_layer(self, args: Wav2Vec2Config):
-        if args.layer_type == "transformer":
-            layer = TransformerSentenceEncoderLayer(
-                embedding_dim=self.embedding_dim,
-                ffn_embedding_dim=args.encoder_ffn_embed_dim,
-                num_attention_heads=args.encoder_attention_heads,
-                dropout=self.dropout,
-                attention_dropout=args.attention_dropout,
-                activation_dropout=args.activation_dropout,
-                activation_fn=args.activation_fn,
-                layer_norm_first=args.layer_norm_first,
-            )
-        elif args.layer_type == "conformer":
-            layer = ConformerWav2Vec2EncoderLayer(
-                embed_dim=self.embedding_dim,
-                ffn_embed_dim=args.encoder_ffn_embed_dim,
-                attention_heads=args.encoder_attention_heads,
-                dropout=args.dropout,
-                depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
-                activation_fn="swish",
-                attn_type=args.attn_type,
-                use_fp16=args.fp16,
-                pos_enc_type="abs",
-            )
-        layer = fsdp_wrap(layer)
-        if args.checkpoint_activations:
-            layer = checkpoint_wrapper(layer)
+    def build_encoder_layer(self, args):
+        layer = None
+        # if args.layer_type == "transformer":
+        #     layer = TransformerSentenceEncoderLayer(
+        #         embedding_dim=self.embedding_dim,
+        #         ffn_embedding_dim=args.encoder_ffn_embed_dim,
+        #         num_attention_heads=args.encoder_attention_heads,
+        #         dropout=self.dropout,
+        #         attention_dropout=args.attention_dropout,
+        #         activation_dropout=args.activation_dropout,
+        #         activation_fn=args.activation_fn,
+        #         layer_norm_first=args.layer_norm_first,
+        #     )
+        # elif args.layer_type == "conformer":
+        #     layer = ConformerWav2Vec2EncoderLayer(
+        #         embed_dim=self.embedding_dim,
+        #         ffn_embed_dim=args.encoder_ffn_embed_dim,
+        #         attention_heads=args.encoder_attention_heads,
+        #         dropout=args.dropout,
+        #         depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
+        #         activation_fn="swish",
+        #         attn_type=args.attn_type,
+        #         use_fp16=args.fp16,
+        #         pos_enc_type="abs",
+        #     )
+        # layer = fsdp_wrap(layer)
+        # if args.checkpoint_activations:
+        #     layer = checkpoint_wrapper(layer)
         return layer
 
-    def __init__(self, args: Wav2Vec2Config):
+    def __init__(self, args):
         super().__init__()
+        ...
+        # self.dropout = args.dropout
+        # self.embedding_dim = args.encoder_embed_dim
+        # self.required_seq_len_multiple = args.required_seq_len_multiple
 
-        self.dropout = args.dropout
-        self.embedding_dim = args.encoder_embed_dim
-        self.required_seq_len_multiple = args.required_seq_len_multiple
+        # pos_conv_depth = getattr(args, "pos_conv_depth", 1)
+        # if pos_conv_depth > 1:
+        #     num_layers = args.pos_conv_depth
+        #     k = max(3, args.conv_pos // num_layers)
 
-        pos_conv_depth = getattr(args, "pos_conv_depth", 1)
-        if pos_conv_depth > 1:
-            num_layers = args.pos_conv_depth
-            k = max(3, args.conv_pos // num_layers)
+        #     def make_conv_block(e, k, g, l):
+        #         return nn.Sequential(
+        #             *[
+        #                 nn.Sequential(
+        #                     nn.Conv1d(
+        #                         e,
+        #                         e,
+        #                         kernel_size=k,
+        #                         padding=k // 2,
+        #                         groups=g,
+        #                     ),
+        #                     SamePad(k),
+        #                     TransposeLast(),
+        #                     LayerNorm(e, elementwise_affine=False),
+        #                     TransposeLast(),
+        #                     nn.GELU(),
+        #                 )
+        #                 for _ in range(l)
+        #             ]
+        #         )
 
-            def make_conv_block(e, k, g, l):
-                return nn.Sequential(
-                    *[
-                        nn.Sequential(
-                            nn.Conv1d(
-                                e,
-                                e,
-                                kernel_size=k,
-                                padding=k // 2,
-                                groups=g,
-                            ),
-                            SamePad(k),
-                            TransposeLast(),
-                            LayerNorm(e, elementwise_affine=False),
-                            TransposeLast(),
-                            nn.GELU(),
-                        )
-                        for _ in range(l)
-                    ]
-                )
+        #     self.pos_conv = make_conv_block(
+        #         self.embedding_dim, k, args.conv_pos_groups, num_layers
+        #     )
 
-            self.pos_conv = make_conv_block(
-                self.embedding_dim, k, args.conv_pos_groups, num_layers
-            )
+        # else:
+        #     self.pos_conv = make_conv_pos(
+        #         self.embedding_dim,
+        #         args.conv_pos,
+        #         args.conv_pos_groups,
+        #     )
 
-        else:
-            self.pos_conv = make_conv_pos(
-                self.embedding_dim,
-                args.conv_pos,
-                args.conv_pos_groups,
-            )
+        # self.layers = nn.ModuleList(
+        #     [
+        #         self.build_encoder_layer(args)
+        #         for _ in range(args.encoder_layers)
+        #     ]
+        # )
+        # self.layer_norm_first = args.layer_norm_first
+        # self.layer_norm = LayerNorm(self.embedding_dim)
+        # self.layerdrop = args.encoder_layerdrop
 
-        self.layers = nn.ModuleList(
-            [
-                self.build_encoder_layer(args)
-                for _ in range(args.encoder_layers)
-            ]
-        )
-        self.layer_norm_first = args.layer_norm_first
-        self.layer_norm = LayerNorm(self.embedding_dim)
-        self.layerdrop = args.encoder_layerdrop
-
-        self.apply(init_bert_params)
+        # self.apply(init_bert_params)
 
     def forward(self, x, padding_mask=None, layer=None):
         x, layer_results = self.extract_features(x, padding_mask, layer)
@@ -707,13 +740,10 @@ class TransformerEncoder(nn.Module):
         return x, layer_results
 
     def extract_features(
-        self,
-        x,
-        padding_mask=None,
-        tgt_layer=None,
-        min_layer=0,
+        self, x, padding_mask=None, tgt_layer=None, min_layer=0,
     ):
 
+        # TODO need to implement index_put
         if padding_mask is not None:
             x = index_put(x, padding_mask, 0)
 
@@ -729,9 +759,7 @@ class TransformerEncoder(nn.Module):
             x, self.required_seq_len_multiple, dim=-2, value=0
         )
         if pad_length > 0 and padding_mask is None:
-            padding_mask = x.new_zeros(
-                (x.size(0), x.size(1)), dtype=torch.bool
-            )
+            padding_mask = x.new_zeros((x.size(0), x.size(1)), dtype=torch.bool)
             padding_mask[:, -pad_length:] = True
         else:
             padding_mask, _ = pad_to_multiple(
@@ -793,50 +821,51 @@ class TransformerEncoder(nn.Module):
 
 class ConformerEncoder(TransformerEncoder):
     def build_encoder_layer(self, args):
-        layer = ConformerWav2Vec2EncoderLayer(
-            embed_dim=self.embedding_dim,
-            ffn_embed_dim=args.encoder_ffn_embed_dim,
-            attention_heads=args.encoder_attention_heads,
-            dropout=args.dropout,
-            depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
-            activation_fn="swish",
-            attn_type=args.attn_type,
-            pos_enc_type=args.pos_enc_type,
-            use_fp16=args.fp16,  # only used for rope
-        )
-        layer = fsdp_wrap(layer)
-        if args.checkpoint_activations:
-            layer = checkpoint_wrapper(layer)
-        return layer
+        ...
+        # layer = ConformerWav2Vec2EncoderLayer(
+        #     embed_dim=self.embedding_dim,
+        #     ffn_embed_dim=args.encoder_ffn_embed_dim,
+        #     attention_heads=args.encoder_attention_heads,
+        #     dropout=args.dropout,
+        #     depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
+        #     activation_fn="swish",
+        #     attn_type=args.attn_type,
+        #     pos_enc_type=args.pos_enc_type,
+        #     use_fp16=args.fp16,  # only used for rope
+        # )
+        # layer = fsdp_wrap(layer)
+        # if args.checkpoint_activations:
+        #     layer = checkpoint_wrapper(layer)
+        # return layer
 
     def __init__(self, args):
         super().__init__(args)
-        self.args = args
-        self.dropout = args.dropout
-        self.embedding_dim = args.encoder_embed_dim
-        self.pos_enc_type = args.pos_enc_type
-        max_source_positions = self.max_positions()
+        # self.args = args
+        # self.dropout = args.dropout
+        # self.embedding_dim = args.encoder_embed_dim
+        # self.pos_enc_type = args.pos_enc_type
+        # max_source_positions = self.max_positions()
 
-        if self.pos_enc_type == "rel_pos":
-            self.embed_positions = RelPositionalEncoding(
-                max_source_positions, self.embedding_dim
-            )
-        elif self.pos_enc_type == "rope":
-            self.embed_positions = None
-        else:
-            raise Exception("Unsupported positional encoding type")
+        # if self.pos_enc_type == "rel_pos":
+        #     self.embed_positions = RelPositionalEncoding(
+        #         max_source_positions, self.embedding_dim
+        #     )
+        # elif self.pos_enc_type == "rope":
+        #     self.embed_positions = None
+        # else:
+        #     raise Exception("Unsupported positional encoding type")
 
-        self.layers = nn.ModuleList(
-            [
-                self.build_encoder_layer(args)
-                for _ in range(args.encoder_layers)
-            ]
-        )
-        self.layer_norm_first = args.layer_norm_first
-        self.layer_norm = LayerNorm(self.embedding_dim)
-        self.layerdrop = args.encoder_layerdrop
+        # self.layers = nn.ModuleList(
+        #     [
+        #         self.build_encoder_layer(args)
+        #         for _ in range(args.encoder_layers)
+        #     ]
+        # )
+        # self.layer_norm_first = args.layer_norm_first
+        # self.layer_norm = LayerNorm(self.embedding_dim)
+        # self.layerdrop = args.encoder_layerdrop
 
-        self.apply(init_bert_params)
+        # self.apply(init_bert_params)
 
     def extract_features(self, x, padding_mask=None, tgt_layer=None):
         if padding_mask is not None:
@@ -900,33 +929,33 @@ class TransformerSentenceEncoderLayer(nn.Module):
     ) -> None:
 
         super().__init__()
-        # Initialize parameters
-        self.embedding_dim = embedding_dim
-        self.dropout = dropout
-        self.activation_dropout = activation_dropout
+        # # Initialize parameters
+        # self.embedding_dim = embedding_dim
+        # self.dropout = dropout
+        # self.activation_dropout = activation_dropout
 
-        # Initialize blocks
-        self.activation_fn = utils.get_activation_fn(activation_fn)
-        self.self_attn = MultiheadAttention(
-            self.embedding_dim,
-            num_attention_heads,
-            dropout=attention_dropout,
-            self_attention=True,
-        )
+        # # Initialize blocks
+        # self.activation_fn = utils.get_activation_fn(activation_fn)
+        # self.self_attn = MultiheadAttention(
+        #     self.embedding_dim,
+        #     num_attention_heads,
+        #     dropout=attention_dropout,
+        #     self_attention=True,
+        # )
 
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(self.activation_dropout)
-        self.dropout3 = nn.Dropout(dropout)
+        # self.dropout1 = nn.Dropout(dropout)
+        # self.dropout2 = nn.Dropout(self.activation_dropout)
+        # self.dropout3 = nn.Dropout(dropout)
 
-        self.layer_norm_first = layer_norm_first
+        # self.layer_norm_first = layer_norm_first
 
-        # layer norm associated with the self attention layer
-        self.self_attn_layer_norm = LayerNorm(self.embedding_dim)
-        self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
-        self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
+        # # layer norm associated with the self attention layer
+        # self.self_attn_layer_norm = LayerNorm(self.embedding_dim)
+        # self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
+        # self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
 
-        # layer norm associated with the position wise feed-forward NN
-        self.final_layer_norm = LayerNorm(self.embedding_dim)
+        # # layer norm associated with the position wise feed-forward NN
+        # self.final_layer_norm = LayerNorm(self.embedding_dim)
 
     def forward(
         self,
