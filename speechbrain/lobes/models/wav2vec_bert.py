@@ -1,9 +1,11 @@
+import functools
 import math
-from typing import Tuple, List
+from typing import Any, Dict, List, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 
 FEATURE_ENC_LAYERS: List[Tuple[int, int, int]] = (
@@ -645,91 +647,118 @@ def make_conv_pos(e, k, g):
     return pos_conv
 
 
+class SamePad(nn.Module):
+    def __init__(self, kernel_size, causal=False):
+        super().__init__()
+        if causal:
+            self.remove = kernel_size - 1
+        else:
+            self.remove = 1 if kernel_size % 2 == 0 else 0
+
+    def forward(self, x):
+        if self.remove > 0:
+            x = x[:, :, : -self.remove]
+        return x
+
+
+class TransposeLast(nn.Module):
+    def __init__(self, deconstruct_idx=None):
+        super().__init__()
+        self.deconstruct_idx = deconstruct_idx
+
+    def forward(self, x):
+        if self.deconstruct_idx is not None:
+            x = x[self.deconstruct_idx]
+        return x.transpose(-2, -1)
+
+
 class TransformerEncoder(nn.Module):
     def build_encoder_layer(self, args):
-        layer = None
-        # if args.layer_type == "transformer":
-        #     layer = TransformerSentenceEncoderLayer(
-        #         embedding_dim=self.embedding_dim,
-        #         ffn_embedding_dim=args.encoder_ffn_embed_dim,
-        #         num_attention_heads=args.encoder_attention_heads,
-        #         dropout=self.dropout,
-        #         attention_dropout=args.attention_dropout,
-        #         activation_dropout=args.activation_dropout,
-        #         activation_fn=args.activation_fn,
-        #         layer_norm_first=args.layer_norm_first,
-        #     )
-        # elif args.layer_type == "conformer":
-        #     layer = ConformerWav2Vec2EncoderLayer(
-        #         embed_dim=self.embedding_dim,
-        #         ffn_embed_dim=args.encoder_ffn_embed_dim,
-        #         attention_heads=args.encoder_attention_heads,
-        #         dropout=args.dropout,
-        #         depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
-        #         activation_fn="swish",
-        #         attn_type=args.attn_type,
-        #         use_fp16=args.fp16,
-        #         pos_enc_type="abs",
-        #     )
-        # layer = fsdp_wrap(layer)
-        # if args.checkpoint_activations:
-        #     layer = checkpoint_wrapper(layer)
+        if self.layer_type == "transformer":
+            layer = TransformerSentenceEncoderLayer(
+                embedding_dim=self.embedding_dim,
+                ffn_embedding_dim=self.encoder_ffn_embed_dim,
+                num_attention_heads=self.encoder_attention_heads,
+                dropout=self.dropout,
+                attention_dropout=self.attention_dropout,
+                activation_dropout=self.activation_dropout,
+                activation_fn=self.activation_fn,
+                layer_norm_first=self.layer_norm_first,
+            )
+        elif self.layer_type == "conformer":
+            ...
+            # TODO Implement ConformerWav2Vec2EncoderLayer
+            # layer = ConformerWav2Vec2EncoderLayer(
+            #     embed_dim=self.embedding_dim,
+            #     ffn_embed_dim=args.encoder_ffn_embed_dim,
+            #     attention_heads=args.encoder_attention_heads,
+            #     dropout=args.dropout,
+            #     depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
+            #     activation_fn="swish",
+            #     attn_type=args.attn_type,
+            #     use_fp16=args.fp16,
+            #     pos_enc_type="abs",
+            # )
+        if self.checkpoint_activations:
+            layer = checkpoint_wrapper(layer)
         return layer
 
-    def __init__(self, args):
+    def __init__(
+        self,
+        dropout,
+        layer_type,
+        encoder_embed_dim,
+        required_seq_len_multiple,
+        conv_pos_groups,
+        conv_pos,
+        layer_norm_first,
+        encoder_layerdrop,
+        pos_conv_depth: int = 1,
+    ):
         super().__init__()
-        ...
-        # self.dropout = args.dropout
-        # self.embedding_dim = args.encoder_embed_dim
-        # self.required_seq_len_multiple = args.required_seq_len_multiple
+        self.dropout = dropout
+        self.embedding_dim = encoder_embed_dim
+        self.required_seq_len_multiple = required_seq_len_multiple
+        self.layer_type = layer_type
+        self.layer_norm_first = layer_norm_first
+        self.layerdrop = encoder_layerdrop
 
-        # pos_conv_depth = getattr(args, "pos_conv_depth", 1)
-        # if pos_conv_depth > 1:
-        #     num_layers = args.pos_conv_depth
-        #     k = max(3, args.conv_pos // num_layers)
+        if pos_conv_depth > 1:
+            num_layers = pos_conv_depth
+            k = max(3, conv_pos // num_layers)
 
-        #     def make_conv_block(e, k, g, l):
-        #         return nn.Sequential(
-        #             *[
-        #                 nn.Sequential(
-        #                     nn.Conv1d(
-        #                         e,
-        #                         e,
-        #                         kernel_size=k,
-        #                         padding=k // 2,
-        #                         groups=g,
-        #                     ),
-        #                     SamePad(k),
-        #                     TransposeLast(),
-        #                     LayerNorm(e, elementwise_affine=False),
-        #                     TransposeLast(),
-        #                     nn.GELU(),
-        #                 )
-        #                 for _ in range(l)
-        #             ]
-        #         )
+            def make_conv_block(e, k, g, l):
+                return nn.Sequential(
+                    *[
+                        nn.Sequential(
+                            nn.Conv1d(
+                                e, e, kernel_size=k, padding=k // 2, groups=g,
+                            ),
+                            SamePad(k),
+                            TransposeLast(),
+                            nn.LayerNorm(e, elementwise_affine=False),
+                            TransposeLast(),
+                            nn.GELU(),
+                        )
+                        for _ in range(l)
+                    ]
+                )
 
-        #     self.pos_conv = make_conv_block(
-        #         self.embedding_dim, k, args.conv_pos_groups, num_layers
-        #     )
+            self.pos_conv = make_conv_block(
+                self.embedding_dim, k, conv_pos_groups, num_layers
+            )
 
-        # else:
-        #     self.pos_conv = make_conv_pos(
-        #         self.embedding_dim,
-        #         args.conv_pos,
-        #         args.conv_pos_groups,
-        #     )
+        else:
+            self.pos_conv = make_conv_pos(
+                self.embedding_dim, conv_pos, conv_pos_groups,
+            )
 
-        # self.layers = nn.ModuleList(
-        #     [
-        #         self.build_encoder_layer(args)
-        #         for _ in range(args.encoder_layers)
-        #     ]
-        # )
-        # self.layer_norm_first = args.layer_norm_first
-        # self.layer_norm = LayerNorm(self.embedding_dim)
-        # self.layerdrop = args.encoder_layerdrop
+        self.layers = nn.ModuleList(
+            [self.build_encoder_layer() for _ in range(self.encoder_layers)]
+        )
+        self.layer_norm = nn.LayerNorm(self.embedding_dim)
 
+        # TODO Check what this doess
         # self.apply(init_bert_params)
 
     def forward(self, x, padding_mask=None, layer=None):
@@ -823,7 +852,6 @@ class TransformerEncoder(nn.Module):
 class ConformerEncoder(TransformerEncoder):
     def build_encoder_layer(self, args):
         ...
-        layer = None
         # layer = ConformerWav2Vec2EncoderLayer(
         #     embed_dim=self.embedding_dim,
         #     ffn_embed_dim=args.encoder_ffn_embed_dim,
@@ -1024,12 +1052,6 @@ class TransformerSentenceEncoderLayer(nn.Module):
         return x, (attn, layer_result)
 
 
-
-
-
-
-
-
 class GumbelVectorQuantizer(nn.Module):
     def __init__(
         self,
@@ -1073,13 +1095,17 @@ class GumbelVectorQuantizer(nn.Module):
         var_dim = vq_dim // groups
         num_groups = groups if not combine_groups else 1
 
-        self.vars = nn.Parameter(torch.FloatTensor(1, num_groups * num_vars, var_dim))
+        self.vars = nn.Parameter(
+            torch.FloatTensor(1, num_groups * num_vars, var_dim)
+        )
         nn.init.uniform_(self.vars)
 
         if weight_proj_depth > 1:
 
             def block(input_dim, output_dim):
-                return nn.Sequential(nn.Linear(input_dim, output_dim), activation)
+                return nn.Sequential(
+                    nn.Linear(input_dim, output_dim), activation
+                )
 
             inner_dim = self.input_dim * weight_proj_factor
             self.weight_proj = nn.Sequential(
@@ -1106,7 +1132,7 @@ class GumbelVectorQuantizer(nn.Module):
 
     def set_num_updates(self, num_updates):
         self.curr_temp = max(
-            self.max_temp * self.temp_decay**num_updates, self.min_temp
+            self.max_temp * self.temp_decay ** num_updates, self.min_temp
         )
 
     def get_codebook_indices(self):
@@ -1121,7 +1147,7 @@ class GumbelVectorQuantizer(nn.Module):
 
             if not self.combine_groups:
                 self.codebook_indices = self.codebook_indices.view(
-                    self.num_vars**self.groups, -1
+                    self.num_vars ** self.groups, -1
                 )
                 for b in range(1, self.groups):
                     self.codebook_indices[:, b] += self.num_vars * b
@@ -1133,7 +1159,7 @@ class GumbelVectorQuantizer(nn.Module):
         return (
             self.vars.squeeze(0)
             .index_select(0, indices)
-            .view(self.num_vars**self.groups, -1)
+            .view(self.num_vars ** self.groups, -1)
         )
 
     def sample_from_codebook(self, b, n):
@@ -1146,14 +1172,18 @@ class GumbelVectorQuantizer(nn.Module):
         sample_idx = torch.randint(low=0, high=cb_size, size=(b * n,))
         indices = indices[sample_idx]
 
-        z = self.vars.squeeze(0).index_select(0, indices.flatten()).view(b, n, -1)
+        z = (
+            self.vars.squeeze(0)
+            .index_select(0, indices.flatten())
+            .view(b, n, -1)
+        )
         return z
 
     def to_codebook_index(self, indices):
         res = indices.new_full(indices.shape[:-1], 0)
         for i in range(self.groups):
             exponent = self.groups - i - 1
-            res += indices[..., i] * (self.num_vars**exponent)
+            res += indices[..., i] * (self.num_vars ** exponent)
         return res
 
     def forward_idx(self, x):
@@ -1193,7 +1223,9 @@ class GumbelVectorQuantizer(nn.Module):
         result["temp"] = self.curr_temp
 
         if self.training:
-            x = F.gumbel_softmax(x.float(), tau=self.curr_temp, hard=True).type_as(x)
+            x = F.gumbel_softmax(
+                x.float(), tau=self.curr_temp, hard=True
+            ).type_as(x)
         else:
             x = hard_x
 
@@ -1222,3 +1254,250 @@ class GumbelVectorQuantizer(nn.Module):
         result["x"] = x
 
         return result
+
+
+def checkpoint_wrapper(m, offload_to_cpu=False):
+    """
+    A friendlier wrapper for performing activation checkpointing.
+    Compared to the PyTorch version, this version:
+    - wraps an nn.Module, so that all subsequent calls will use checkpointing
+    - handles keyword arguments in the forward
+    - handles non-Tensor outputs from the forward
+    Usage::
+        checkpointed_module = checkpoint_wrapper(my_module, offload_to_cpu=True)
+        a, b = checkpointed_module(x, y=3, z=torch.Tensor([1]))
+    """
+    # should I check whether original_forward has already been set?
+    assert not hasattr(
+        m, "precheckpoint_forward"
+    ), "checkpoint function has already been applied?"
+    m.precheckpoint_forward = m.forward
+    m.forward = functools.partial(
+        _checkpointed_forward,
+        m.precheckpoint_forward,  # original_forward
+        offload_to_cpu,
+    )
+    return m
+
+
+def unwrap_checkpoint(m: torch.nn.Module):
+    """
+    unwrap a module and its children from checkpoint_wrapper
+    """
+    for module in m.modules():
+        if hasattr(module, "precheckpoint_forward"):
+            module.forward = module.precheckpoint_forward
+            del module.precheckpoint_forward
+        if hasattr(module, "old_deepcopy_method"):
+            module.__deepcopy__ = module.old_deepcopy_method
+            del module.old_deepcopy_method
+    return m
+
+
+def _checkpointed_forward(original_forward, offload_to_cpu, *args, **kwargs):
+    # Autograd Functions in PyTorch work best with positional args, since
+    # the backward must return gradients (or None) for every input argument.
+    # We can flatten keyword arguments to make this easier.
+    kwarg_keys, flat_args = pack_kwargs(*args, **kwargs)
+    parent_ctx_dict = {"offload": offload_to_cpu}
+    output = CheckpointFunction.apply(
+        original_forward, parent_ctx_dict, kwarg_keys, *flat_args
+    )
+    if isinstance(output, torch.Tensor):
+        return output
+    else:
+        packed_non_tensor_outputs = parent_ctx_dict["packed_non_tensor_outputs"]
+        if packed_non_tensor_outputs:
+            output = unpack_non_tensors(output, packed_non_tensor_outputs)
+        return output
+
+
+def pack_kwargs(*args, **kwargs) -> Tuple[List[str], List[Any]]:
+    """
+    Usage::
+        kwarg_keys, flat_args = pack_kwargs(1, 2, a=3, b=4)
+        args, kwargs = unpack_kwargs(kwarg_keys, flat_args)
+        assert args == [1, 2]
+        assert kwargs == {"a": 3, "b": 4}
+    """
+    kwarg_keys = []
+    flat_args = list(args)
+    for k, v in kwargs.items():
+        kwarg_keys.append(k)
+        flat_args.append(v)
+    return kwarg_keys, flat_args
+
+
+def unpack_kwargs(
+    kwarg_keys: List[str], flat_args: List[Any]
+) -> Tuple[List[Any], Dict[str, Any]]:
+    if len(kwarg_keys) == 0:
+        return flat_args, {}
+    args = flat_args[: -len(kwarg_keys)]
+    kwargs = {k: v for k, v in zip(kwarg_keys, flat_args[-len(kwarg_keys) :])}
+    return args, kwargs
+
+
+def split_non_tensors(
+    mixed: Union[torch.Tensor, Tuple[Any]]
+) -> Tuple[Tuple[torch.Tensor], Dict[str, List[Any]]]:
+    """
+    Usage::
+        x = torch.Tensor([1])
+        y = torch.Tensor([2])
+        tensors, packed_non_tensors = split_non_tensors((x, y, None, 3))
+        recon = unpack_non_tensors(tensors, packed_non_tensors)
+        assert recon == (x, y, None, 3)
+    """
+    if isinstance(mixed, torch.Tensor):
+        return (mixed,), None
+    tensors = []
+    packed_non_tensors = {"is_tensor": [], "objects": []}
+    for o in mixed:
+        if isinstance(o, torch.Tensor):
+            packed_non_tensors["is_tensor"].append(True)
+            tensors.append(o)
+        else:
+            packed_non_tensors["is_tensor"].append(False)
+            packed_non_tensors["objects"].append(o)
+    return tuple(tensors), packed_non_tensors
+
+
+def unpack_non_tensors(
+    tensors: Tuple[torch.Tensor], packed_non_tensors: Dict[str, List[Any]],
+) -> Tuple[Any]:
+    if packed_non_tensors is None:
+        return tensors
+    assert isinstance(packed_non_tensors, dict)
+    mixed = []
+    is_tensor_list = packed_non_tensors["is_tensor"]
+    objects = packed_non_tensors["objects"]
+    assert len(tensors) + len(objects) == len(is_tensor_list)
+    obj_i = tnsr_i = 0
+    for is_tensor in is_tensor_list:
+        if is_tensor:
+            mixed.append(tensors[tnsr_i])
+            tnsr_i += 1
+        else:
+            mixed.append(objects[obj_i])
+            obj_i += 1
+    return tuple(mixed)
+
+
+def get_rng_state():
+    state = {"torch_rng_state": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda_rng_state"] = torch.cuda.get_rng_state()
+    return state
+
+
+def set_rng_state(state):
+    torch.set_rng_state(state["torch_rng_state"])
+    if torch.cuda.is_available():
+        torch.cuda.set_rng_state(state["cuda_rng_state"])
+
+
+class CheckpointFunction(torch.autograd.Function):
+    """Similar to the torch version, but support non-Tensor outputs.
+    The caller is expected to provide a dict (*parent_ctx_dict*) that will hold
+    the non-Tensor outputs. These should be combined with the Tensor *outputs*
+    by calling ``unpack_non_tensors``.
+    """
+
+    @staticmethod
+    def forward(ctx, run_function, parent_ctx_dict, kwarg_keys, *args):
+        if (
+            torch.is_grad_enabled()
+        ):  # grad may be disabled, e.g., during validation
+            checkpoint.check_backward_validity(args)
+
+        ctx.run_function = run_function
+        ctx.kwarg_keys = kwarg_keys
+        ctx.fwd_rng_state = get_rng_state()
+
+        tensor_inputs, packed_non_tensor_inputs = split_non_tensors(args)
+        if parent_ctx_dict["offload"]:
+            ctx.fwd_device = tuple(x.device for x in tensor_inputs)
+            ctx.grad_requirements = tuple(
+                x.requires_grad for x in tensor_inputs
+            )
+            tensor_inputs = tuple(
+                x.to(torch.device("cpu"), non_blocking=True)
+                for x in tensor_inputs
+            )
+
+        else:
+            ctx.fwd_device, ctx.grad_requirements = None, None
+
+        ctx.save_for_backward(*tensor_inputs)
+        ctx.packed_non_tensor_inputs = packed_non_tensor_inputs
+
+        with torch.no_grad():
+            unpacked_args, unpacked_kwargs = unpack_kwargs(kwarg_keys, args)
+            outputs = run_function(*unpacked_args, **unpacked_kwargs)
+
+        if isinstance(outputs, torch.Tensor):
+            return outputs
+        else:
+            # Autograd Functions don't like non-Tensor outputs. We can split the
+            # non-Tensor and Tensor outputs, returning the former by reference
+            # through *parent_ctx_dict* and returning the latter directly.
+            outputs, packed_non_tensor_outputs = split_non_tensors(outputs)
+            parent_ctx_dict[
+                "packed_non_tensor_outputs"
+            ] = packed_non_tensor_outputs
+            return outputs
+
+    @staticmethod
+    def backward(ctx, *args):
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError(
+                "Checkpointing is not compatible with .grad(), please use .backward() if possible"
+            )
+
+        tensor_inputs: Tuple = ctx.saved_tensors
+        tensor_inputs = checkpoint.detach_variable(tensor_inputs)
+        if ctx.fwd_device is not None:
+            tensor_inputs = [
+                t.to(ctx.fwd_device[i], non_blocking=True)
+                for i, t in enumerate(tensor_inputs)
+            ]
+            for i, need_grad in enumerate(ctx.grad_requirements):
+                tensor_inputs[i].requires_grad = need_grad
+        inputs = unpack_non_tensors(tensor_inputs, ctx.packed_non_tensor_inputs)
+
+        # Store the current states.
+        bwd_rng_state = get_rng_state()
+
+        # Set the states to what it used to be before the forward pass.
+        set_rng_state(ctx.fwd_rng_state)
+
+        with torch.enable_grad():
+            unpacked_args, unpacked_kwargs = unpack_kwargs(
+                ctx.kwarg_keys, inputs
+            )
+            outputs = ctx.run_function(*unpacked_args, **unpacked_kwargs)
+            tensor_outputs, _ = split_non_tensors(outputs)
+        # Set the states back to what it was at the start of this function.
+        set_rng_state(bwd_rng_state)
+
+        # Run backward() with only Tensors that require grad
+        outputs_with_grad = []
+        args_with_grad = []
+        for i in range(len(tensor_outputs)):
+            if tensor_outputs[i].requires_grad:
+                outputs_with_grad.append(tensor_outputs[i])
+                args_with_grad.append(args[i])
+        if len(outputs_with_grad) == 0:
+            raise RuntimeError(
+                "None of the outputs have requires_grad=True, "
+                "this checkpoint() is not necessary"
+            )
+
+        torch.autograd.backward(outputs_with_grad, args_with_grad)
+
+        grads = tuple(
+            inp.grad if isinstance(inp, torch.Tensor) else None
+            for inp in inputs
+        )
+        return (None, None, None) + grads
