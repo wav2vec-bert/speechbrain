@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-
 FEATURE_ENC_LAYERS: List[Tuple[int, int, int]] = (
     [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] + [(512, 2, 2)]
 )
@@ -945,37 +944,44 @@ class TransformerSentenceEncoderLayer(nn.Module):
         attention_dropout: float = 0.1,
         activation_dropout: float = 0.1,
         activation_fn: str = "relu",
-        layer_norm_first: bool = False,
-    ) -> None:
+        layer_norm_first: bool = False
+     ) -> None:
 
         super().__init__()
         # # Initialize parameters
-        # self.embedding_dim = embedding_dim
-        # self.dropout = dropout
-        # self.activation_dropout = activation_dropout
+        self.embedding_dim = embedding_dim
+        self.dropout = dropout
+        self.activation_dropout = activation_dropout
 
         # # Initialize blocks
-        # self.activation_fn = utils.get_activation_fn(activation_fn)
+        self.activation_fn = get_activation_fn(activation_fn)
+        
+        
+
+        self.self_attn = torch.nn.MultiheadAttention(self.embedding_dim,
+             num_attention_heads,
+             dropout=attention_dropout)
+        # # old deinfition of multiheadattention (from fairseq)
         # self.self_attn = MultiheadAttention(
-        #     self.embedding_dim,
+        #    self.embedding_dim,
         #     num_attention_heads,
         #     dropout=attention_dropout,
         #     self_attention=True,
         # )
 
-        # self.dropout1 = nn.Dropout(dropout)
-        # self.dropout2 = nn.Dropout(self.activation_dropout)
-        # self.dropout3 = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(self.activation_dropout)
+        self.dropout3 = nn.Dropout(dropout)
 
-        # self.layer_norm_first = layer_norm_first
+        self.layer_norm_first = layer_norm_first
 
         # # layer norm associated with the self attention layer
-        # self.self_attn_layer_norm = LayerNorm(self.embedding_dim)
-        # self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
-        # self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
+        self.self_attn_layer_norm = nn.LayerNorm(self.embedding_dim)
+        self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
+        self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
 
         # # layer norm associated with the position wise feed-forward NN
-        # self.final_layer_norm = LayerNorm(self.embedding_dim)
+        self.final_layer_norm = nn.LayerNorm(self.embedding_dim)
 
     def forward(
         self,
@@ -1491,3 +1497,51 @@ class CheckpointFunction(torch.autograd.Function):
             for inp in inputs
         )
         return (None, None, None) + grads
+
+
+
+
+
+
+
+
+
+
+
+
+
+def get_activation_fn(activation: str):
+    """Returns the activation function corresponding to `activation`"""
+    from fairseq.modules import gelu, gelu_accurate
+
+    if activation == "relu":
+        return F.relu
+    elif activation == "relu_squared":
+        return relu_squared
+    elif activation == "gelu":
+        return gelu
+    elif activation == "gelu_accurate":
+        return gelu_accurate
+    elif activation == "tanh":
+        return torch.tanh
+    elif activation == "linear":
+        return lambda x: x
+    elif activation == "swish":
+        return torch.nn.SiLU
+    else:
+        raise RuntimeError("--activation-fn {} not supported".format(activation))
+
+
+
+def gelu_accurate(x):
+    if not hasattr(gelu_accurate, "_a"):
+        gelu_accurate._a = math.sqrt(2 / math.pi)
+    return (
+        0.5 * x * (1 + torch.tanh(gelu_accurate._a * (x + 0.044715 * torch.pow(x, 3))))
+    )
+
+def relu_squared(x: torch.Tensor):
+    return F.relu(x).pow(2)
+
+def gelu(x: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.gelu(x.float()).type_as(x)
