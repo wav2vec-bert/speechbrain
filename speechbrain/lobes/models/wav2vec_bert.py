@@ -601,26 +601,16 @@ class ConvFeatureExtractionModel(nn.Module):
     ):
         super().__init__()
 
-        def block(
-            n_in, n_out, k, stride, conv_bias=False,
-        ):
-            def make_conv():
-                conv = nn.Conv1d(n_in, n_out, k, stride=stride, bias=conv_bias)
-                nn.init.kaiming_normal_(conv.weight)
-                return conv
-
-            return nn.Sequential(make_conv(), nn.Dropout(p=dropout), nn.GELU())
-
         in_d = 1
         self.conv_layers = nn.ModuleList()
-        for i, cl in enumerate(conv_layers):
-            assert len(cl) == 3, "invalid conv definition: " + str(cl)
-            (dim, k, stride) = cl
-
-            self.conv_layers.append(
-                block(in_d, dim, k, stride, conv_bias=conv_bias,)
-            )
+        for i, conv_layer_params in enumerate(conv_layers):
+            (dim, k, stride) = conv_layer_params
+            conv_layer = nn.Conv1d(in_d, dim, k, stride=stride, bias=conv_bias)
+            nn.init.kaiming_normal_(conv_layer.weight)
+            conv_block = nn.Sequential(conv_layer, nn.Dropout(p=dropout), nn.GELU())
+            self.conv_layers.append(conv_block)
             in_d = dim
+
 
     def forward(self, x):
 
