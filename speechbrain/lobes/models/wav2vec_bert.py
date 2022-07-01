@@ -604,23 +604,24 @@ class ConvFeatureExtractionModel(nn.Module):
         ):
         super().__init__()
 
-        in_d = 1
-        self.conv_layers = nn.ModuleList()
+        # creation of conv blocks
+        in_d = 1 # dim input 
+        self.conv_layers = nn.ModuleList() # list of conv blocks
         for i, conv_layer_params in enumerate(conv_layers):
             (dim, k, stride) = conv_layer_params
-            conv_layer = nn.Conv1d(in_d, dim, k, stride=stride, bias=conv_bias)
-            nn.init.kaiming_normal_(conv_layer.weight)
+            conv_layer = nn.Conv1d(in_d, dim, k, stride=stride, bias=conv_bias) # conv layer
+            nn.init.kaiming_normal_(conv_layer.weight) # intialisation of conv layer weights
             if i == 0: # group norm for 1st conv block
                 conv_block =nn.Sequential(conv_layer,nn.Dropout(p=dropout),Fp32GroupNorm(dim, dim, affine=True),nn.GELU())
             else: # clasical conv block for others
                 conv_block = nn.Sequential(conv_layer, nn.Dropout(p=dropout), nn.GELU())
             self.conv_layers.append(conv_block)
-            in_d = dim
+            in_d = dim # new input dim for next block
 
 
     def forward(self, x):
 
-        x = x.unsqueeze(1)
+        x = x.unsqueeze(1) # Returns a new tensor with a dimension of size one inserted at the specified position.
 
         for conv in self.conv_layers:
             x = conv(x)
