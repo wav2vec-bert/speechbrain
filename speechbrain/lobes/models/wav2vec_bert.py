@@ -11,8 +11,9 @@ FEATURE_ENC_LAYERS: List[Tuple[int, int, int]] = (
     [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] + [(512, 2, 2)]
 )
 
-# based on https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/wav2vec/wav2vec2.py
+from fairseq.data.data_utils import compute_mask_indices
 
+# based on https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/wav2vec/wav2vec2.py
 
 def is_xla_tensor(tensor):
     return torch.is_tensor(tensor) and tensor.device.type == "xla"
@@ -61,7 +62,8 @@ class Wav2Vec2(nn.Module):
         feature_enc_layers: List[Tuple[int, int, int]] = FEATURE_ENC_LAYERS,
         conv_bias: bool = False,
         dropout: float = 0.0,
-        encoder_emmbed_dim = 768,
+        encoder_embed_dim = 768,
+        mask_prob = 0.65, # probability of replacing a token with mask (supposed to use in pretraining)
     ):
         super().__init__()
         ...
@@ -76,44 +78,49 @@ class Wav2Vec2(nn.Module):
         self.dropout = dropout
         self.encoder_embed_dim = encoder_embed_dim
 
+        # definiotion of conv block for first part of model
         self.feature_extractor = ConvFeatureExtractionModel(
             conv_layers=feature_enc_layers,
             dropout=self.dropout,
             conv_bias=self.conv_bias,
         )
 
+
+        # adding linear layer if not same dimension from dim output ConvFeatureExtractionModel and dimm encoder 
         self.post_extract_proj = (
-             nn.Linear(self.embed, encoder_embed_dim)
-             if self.embed != cfg.encoder_embed_dim
+             nn.Linear(self.embed, self.encoder_embed_dim)
+             if self.embed != self.encoder_embed_dim
              else None
          )
 
-        # self.crop_seq_to_multiple = cfg.crop_seq_to_multiple
 
-        # self.mask_prob = cfg.mask_prob
-        # self.mask_selection = cfg.mask_selection
-        # self.mask_other = cfg.mask_other
-        # self.mask_length = cfg.mask_length
-        # self.no_mask_overlap = cfg.no_mask_overlap
-        # self.mask_min_space = cfg.mask_min_space
+        self.mask_prob = mask_prob
 
-        # self.mask_channel_prob = cfg.mask_channel_prob
-        # self.mask_channel_before = cfg.mask_channel_before
-        # self.mask_channel_selection = cfg.mask_channel_selection
-        # self.mask_channel_other = cfg.mask_channel_other
-        # self.mask_channel_length = cfg.mask_channel_length
-        # self.no_mask_channel_overlap = cfg.no_mask_channel_overlap
-        # self.mask_channel_min_space = cfg.mask_channel_min_space
+        # params for compute_mask_indices
+        self.mask_selection = 'static' # how to choose mask length 
+        self.mask_other =  0.0 # secondary mask argument (used for more complex distributions)
+        self.mask_length = 10 
+        self.no_mask_overlap =  False # whether to allow masks to overlap
+        self.mask_min_space = 1 # min space between spans (if no overlap is enabled)
 
-        # self.dropout_input = nn.Dropout(cfg.dropout_input)
-        # self.dropout_features = nn.Dropout(cfg.dropout_features)
+        # params for compute mask channel indices
+        self.mask_channel_prob = 0.0 # probability of replacing a feature with 0
+        self.mask_channel_before = False
+        self.mask_channel_selection = 'static' # how to choose mask length for channel masking
+        self.mask_channel_other = 0 # secondary mask argument (used for more complex distributions)
+        self.mask_channel_length = 10 # length of the mask for features (channels)
+        self.no_mask_channel_overlap = False # whether to allow channel masks to overlap
+        self.mask_channel_min_space = 1 # min space between spans (if no overlap is enabled)
 
-        # self.feature_grad_mult = cfg.feature_grad_mult
+        self.dropout_input = nn.Dropout(0.0) # dropout to apply to the input (after feat extr)
+        self.dropout_features = nn.Dropout(0.0) # dropout to apply to the features (after feat extr)
 
-        # self.quantizer = None
-        # self.input_quantizer = None
+        self.feature_grad_mult =  1.0 # multiply feature extractor var grads by this
 
-        # self.n_negatives = cfg.num_negatives
+        self.quantizer = None
+        self.input_quantizer = None
+
+        # self.n_negatives = 100 # number of negative examples from the same sample
         # self.cross_sample_negatives = cfg.cross_sample_negatives
         # self.codebook_negatives = cfg.codebook_negatives
         # self.negatives_from_everywhere = cfg.negatives_from_everywhere
@@ -216,13 +223,13 @@ class Wav2Vec2(nn.Module):
         #             padding_mask,
         #             self.mask_prob,
         #             self.mask_length,
-        #             self.mask_selection,
-        #             self.mask_other,
+        #             mask_selection = 'static',
+        #             mask_other = 0.0,
         #             min_masks=2,
         #             no_overlap=self.no_mask_overlap,
         #             min_space=self.mask_min_space,
-        #             require_same_masks=self.cfg.require_same_masks,
-        #             mask_dropout=self.cfg.mask_dropout,
+        #             require_same_masks= True,
+        #             mask_dropout=0.0,
         #         )
         #         mask_indices = torch.from_numpy(mask_indices).to(x.device)
         #     x = index_put(x, mask_indices, self.mask_emb)
@@ -403,12 +410,6 @@ class Wav2Vec2(nn.Module):
         # else:
         #     padding_mask = None
 
-        # time_steps_to_drop = features.size(1) % self.crop_seq_to_multiple
-        # if time_steps_to_drop != 0:
-        #     features = features[:, :-time_steps_to_drop]
-        #     unmasked_features = unmasked_features[:, :-time_steps_to_drop]
-        #     if padding_mask is not None:
-        #         padding_mask = padding_mask[:, :-time_steps_to_drop]
         # if self.post_extract_proj is not None:
         #     features = self.post_extract_proj(features)
 
