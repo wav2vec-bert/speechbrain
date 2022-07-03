@@ -48,10 +48,12 @@ class Wav2Vec2(nn.Module):
             conv_bias=self.conv_bias,
         )
 
+        self.quantize_input = True 
+
         # adding linear layer if not same dimension from dim output ConvFeatureExtractionModel and dimm encoder 
         self.post_extract_proj = (
              nn.Linear(self.embed, self.encoder_embed_dim)
-             if self.embed != self.encoder_embed_dim
+             if self.embed != self.encoder_embed_dim and not self.quantize_input
              else None
          )
 
@@ -81,8 +83,8 @@ class Wav2Vec2(nn.Module):
         self.quantizer = None
         self.input_quantizer = None
 
-        # self.n_negatives = 100 # number of negative examples from the same sample
-        # self.cross_sample_negatives = cfg.cross_sample_negatives
+        self.n_negatives = 100 # number of negative examples from the same sample
+        self.cross_sample_negatives = 0 # number of negative examples from the samples
         # self.codebook_negatives = cfg.codebook_negatives
         # self.negatives_from_everywhere = cfg.negatives_from_everywhere
 
@@ -143,7 +145,7 @@ class Wav2Vec2(nn.Module):
         #     encoder_cls = ConformerEncoder
 
         # self.encoder = encoder_cls(cfg)
-        # self.layer_norm = LayerNorm(self.embed)
+        self.layer_norm = nn.LayerNorm(self.embed)
 
         # self.target_glu = None
         # if cfg.target_glu:
@@ -221,7 +223,7 @@ class Wav2Vec2(nn.Module):
 
     def sample_negatives(self, y, num, padding_count=None):
         """
-        negative sampling allows reduce the cost of process predicting the results
+        generate false data from input data given in random uniform order. Permits to accelerate the learning
         """
 
         # if no number of negative sample selected, return default y output
@@ -285,6 +287,7 @@ class Wav2Vec2(nn.Module):
 
     def compute_preds(self, x, y, negatives):
 
+        # get indexes of negatives selected
         neg_is_pos = (y == negatives).all(-1)
         y = y.unsqueeze(0)
         targets = torch.cat([y, negatives], dim=0)
@@ -301,6 +304,7 @@ class Wav2Vec2(nn.Module):
                     if is_xla_tensor(logits)
                     else float("-inf")
                 )
+            # put to -inf for logits with index True of neg_is_pos if exist
             logits[1:] = index_put(logits[1:], neg_is_pos, self._inftensor)
 
         return logits
@@ -334,185 +338,185 @@ class Wav2Vec2(nn.Module):
         padding_count=None,
     ):
         ...
-        # if self.feature_grad_mult > 0:
-        #     features = self.feature_extractor(source)
-        #     if self.feature_grad_mult != 1.0:
-        #         features = GradMultiply.apply(features, self.feature_grad_mult)
-        # else:
-        #     with torch.no_grad():
-        #         features = self.feature_extractor(source)
+        if self.feature_grad_mult > 0:
+            features = self.feature_extractor(source)
+            if self.feature_grad_mult != 1.0:
+                features = GradMultiply.apply(features, self.feature_grad_mult)
+        else:
+            with torch.no_grad():
+                features = self.feature_extractor(source)
 
-        # features_pen = features.float().pow(2).mean()
+        features_pen = features.float().pow(2).mean()
 
-        # features = features.transpose(1, 2)
-        # features = self.layer_norm(features)
-        # unmasked_features = features.clone()
+        features = features.transpose(1, 2)
+        features = self.layer_norm(features)
+        unmasked_features = features.clone()
 
-        # if padding_mask is not None and padding_mask.any():
-        #     input_lengths = (1 - padding_mask.long()).sum(-1)
-        #     # apply conv formula to get real output_lengths
-        #     output_lengths = self._get_feat_extract_output_lengths(
-        #         input_lengths
-        #     )
+        if padding_mask is not None and padding_mask.any():
+            input_lengths = (1 - padding_mask.long()).sum(-1)
+            # apply conv formula to get real output_lengths
+            output_lengths = self._get_feat_extract_output_lengths(
+                input_lengths
+            )
 
-        #     padding_mask = torch.zeros(
-        #         features.shape[:2],
-        #         dtype=features.dtype,
-        #         device=features.device,
-        #     )
+            padding_mask = torch.zeros(
+                features.shape[:2],
+                dtype=features.dtype,
+                device=features.device,
+            )
 
-        #     # these two operations makes sure that all values
-        #     # before the output lengths indices are attended to
-        #     padding_mask[
-        #         (
-        #             torch.arange(
-        #                 padding_mask.shape[0], device=padding_mask.device
-        #             ),
-        #             output_lengths - 1,
-        #         )
-        #     ] = 1
-        #     padding_mask = (
-        #         1 - padding_mask.flip([-1]).cumsum(-1).flip([-1])
-        #     ).bool()
-        # else:
-        #     padding_mask = None
+            # these two operations makes sure that all values
+            # before the output lengths indices are attended to
+            padding_mask[
+                (
+                    torch.arange(
+                        padding_mask.shape[0], device=padding_mask.device
+                    ),
+                    output_lengths - 1,
+                )
+            ] = 1
+            padding_mask = (
+                1 - padding_mask.flip([-1]).cumsum(-1).flip([-1])
+            ).bool()
+        else:
+            padding_mask = None
 
-        # if self.post_extract_proj is not None:
-        #     features = self.post_extract_proj(features)
+        if self.post_extract_proj is not None:
+            features = self.post_extract_proj(features)
 
-        # features = self.dropout_input(features)
-        # unmasked_features = self.dropout_features(unmasked_features)
+        features = self.dropout_input(features)
+        unmasked_features = self.dropout_features(unmasked_features)
 
-        # num_vars = None
-        # code_ppl = None
-        # prob_ppl = None
-        # curr_temp = None
+        num_vars = None
+        code_ppl = None
+        prob_ppl = None
+        curr_temp = None
 
-        # if self.input_quantizer:
-        #     q = self.input_quantizer(features, produce_targets=False)
-        #     features = q["x"]
-        #     num_vars = q["num_vars"]
-        #     code_ppl = q["code_perplexity"]
-        #     prob_ppl = q["prob_perplexity"]
-        #     curr_temp = q["temp"]
-        #     features = self.project_inp(features)
+        if self.input_quantizer:
+            q = self.input_quantizer(features, produce_targets=False)
+            features = q["x"]
+            num_vars = q["num_vars"]
+            code_ppl = q["code_perplexity"]
+            prob_ppl = q["prob_perplexity"]
+            curr_temp = q["temp"]
+            features = self.project_inp(features)
 
-        # if mask:
-        #     x, mask_indices = self.apply_mask(
-        #         features,
-        #         padding_mask,
-        #         mask_indices=mask_indices,
-        #         mask_channel_indices=mask_channel_indices,
-        #     )
-        #     if not is_xla_tensor(x) and mask_indices is not None:
-        #         # tpu-comment: reducing the size in a dynamic way causes
-        #         # too many recompilations on xla.
-        #         y = unmasked_features[mask_indices].view(
-        #             unmasked_features.size(0), -1, unmasked_features.size(-1)
-        #         )
-        #     else:
-        #         y = unmasked_features
-        # else:
-        #     x = features
-        #     y = unmasked_features
-        #     mask_indices = None
+        if mask:
+            x, mask_indices = self.apply_mask(
+                features,
+                padding_mask,
+                mask_indices=mask_indices,
+                mask_channel_indices=mask_channel_indices,
+            )
+            if not is_xla_tensor(x) and mask_indices is not None:
+                # tpu-comment: reducing the size in a dynamic way causes
+                # too many recompilations on xla.
+                y = unmasked_features[mask_indices].view(
+                    unmasked_features.size(0), -1, unmasked_features.size(-1)
+                )
+            else:
+                y = unmasked_features
+        else:
+            x = features
+            y = unmasked_features
+            mask_indices = None
 
-        # x, layer_results = self.encoder(
-        #     x, padding_mask=padding_mask, layer=layer
-        # )
+        x, layer_results = self.encoder(
+            x, padding_mask=padding_mask, layer=layer
+        )
 
-        # if features_only:
-        #     return {
-        #         "x": x,
-        #         "padding_mask": padding_mask,
-        #         "features": unmasked_features,
-        #         "layer_results": layer_results,
-        #     }
+        if features_only:
+            return {
+                "x": x,
+                "padding_mask": padding_mask,
+                "features": unmasked_features,
+                "layer_results": layer_results,
+            }
 
-        # if self.quantizer:
-        #     if self.negatives_from_everywhere:
-        #         q = self.quantizer(unmasked_features, produce_targets=False)
-        #         y = q["x"]
-        #         num_vars = q["num_vars"]
-        #         code_ppl = q["code_perplexity"]
-        #         prob_ppl = q["prob_perplexity"]
-        #         curr_temp = q["temp"]
-        #         y = self.project_q(y)
+        if self.quantizer:
+            if self.negatives_from_everywhere:
+                q = self.quantizer(unmasked_features, produce_targets=False)
+                y = q["x"]
+                num_vars = q["num_vars"]
+                code_ppl = q["code_perplexity"]
+                prob_ppl = q["prob_perplexity"]
+                curr_temp = q["temp"]
+                y = self.project_q(y)
 
-        #         negs, _ = self.sample_negatives(
-        #             y,
-        #             mask_indices[0].sum(),
-        #             padding_count=padding_count,
-        #         )
-        #         y = y[mask_indices].view(y.size(0), -1, y.size(-1))
+                negs, _ = self.sample_negatives(
+                    y,
+                    mask_indices[0].sum(),
+                    padding_count=padding_count,
+                )
+                y = y[mask_indices].view(y.size(0), -1, y.size(-1))
 
-        #     else:
-        #         q = self.quantizer(y, produce_targets=False)
-        #         y = q["x"]
-        #         num_vars = q["num_vars"]
-        #         code_ppl = q["code_perplexity"]
-        #         prob_ppl = q["prob_perplexity"]
-        #         curr_temp = q["temp"]
+            else:
+                q = self.quantizer(y, produce_targets=False)
+                y = q["x"]
+                num_vars = q["num_vars"]
+                code_ppl = q["code_perplexity"]
+                prob_ppl = q["prob_perplexity"]
+                curr_temp = q["temp"]
 
-        #         y = self.project_q(y)
+                y = self.project_q(y)
 
-        #         negs, _ = self.sample_negatives(
-        #             y,
-        #             y.size(1),
-        #             padding_count=padding_count,
-        #         )
+                negs, _ = self.sample_negatives(
+                    y,
+                    y.size(1),
+                    padding_count=padding_count,
+                )
 
-        #     if self.codebook_negatives > 0:
-        #         cb_negs = self.quantizer.sample_from_codebook(
-        #             y.size(0) * y.size(1), self.codebook_negatives
-        #         )
-        #         cb_negs = cb_negs.view(
-        #             self.codebook_negatives, y.size(0), y.size(1), -1
-        #         )  # order doesnt matter
-        #         cb_negs = self.project_q(cb_negs)
-        #         negs = torch.cat([negs, cb_negs], dim=0)
-        # else:
-        #     y = self.project_q(y)
+            if self.codebook_negatives > 0:
+                cb_negs = self.quantizer.sample_from_codebook(
+                    y.size(0) * y.size(1), self.codebook_negatives
+                )
+                cb_negs = cb_negs.view(
+                    self.codebook_negatives, y.size(0), y.size(1), -1
+                )  # order doesnt matter
+                cb_negs = self.project_q(cb_negs)
+                negs = torch.cat([negs, cb_negs], dim=0)
+        else:
+            y = self.project_q(y)
 
-        #     if self.negatives_from_everywhere:
-        #         negs, _ = self.sample_negatives(
-        #             unmasked_features,
-        #             y.size(1),
-        #             padding_count=padding_count,
-        #         )
-        #         negs = self.project_q(negs)
-        #     else:
-        #         negs, _ = self.sample_negatives(
-        #             y,
-        #             y.size(1),
-        #             padding_count=padding_count,
-        #         )
+            if self.negatives_from_everywhere:
+                negs, _ = self.sample_negatives(
+                    unmasked_features,
+                    y.size(1),
+                    padding_count=padding_count,
+                )
+                negs = self.project_q(negs)
+            else:
+                negs, _ = self.sample_negatives(
+                    y,
+                    y.size(1),
+                    padding_count=padding_count,
+                )
 
-        # if not is_xla_tensor(x):
-        #     # tpu-comment: reducing the size in a dynamic way causes
-        #     # too many recompilations on xla.
-        #     x = x[mask_indices].view(x.size(0), -1, x.size(-1))
+        if not is_xla_tensor(x):
+            # tpu-comment: reducing the size in a dynamic way causes
+            # too many recompilations on xla.
+            x = x[mask_indices].view(x.size(0), -1, x.size(-1))
 
-        # if self.target_glu:
-        #     y = self.target_glu(y)
-        #     negs = self.target_glu(negs)
+        if self.target_glu:
+            y = self.target_glu(y)
+            negs = self.target_glu(negs)
 
-        # x = self.final_proj(x)
-        # x = self.compute_preds(x, y, negs)
+        x = self.final_proj(x)
+        x = self.compute_preds(x, y, negs)
 
-        # result = {
-        #     "x": x,
-        #     "padding_mask": padding_mask,
-        #     "features_pen": features_pen,
-        # }
+        result = {
+            "x": x,
+            "padding_mask": padding_mask,
+            "features_pen": features_pen,
+        }
 
-        # if prob_ppl is not None:
-        #     result["prob_perplexity"] = prob_ppl
-        #     result["code_perplexity"] = code_ppl
-        #     result["num_vars"] = num_vars
-        #     result["temp"] = curr_temp
+        if prob_ppl is not None:
+            result["prob_perplexity"] = prob_ppl
+            result["code_perplexity"] = code_ppl
+            result["num_vars"] = num_vars
+            result["temp"] = curr_temp
 
-        # return result
+        return result
 
     def quantize(self, x):
         assert self.quantizer is not None
@@ -1571,7 +1575,7 @@ class ConvolutionModule(torch.nn.Module):
         assert (
             depthwise_kernel_size - 1
         ) % 2 == 0, "kernel_size should be a odd number for 'SAME' padding"
-        self.layer_norm = nnLayerNorm(embed_dim)
+        self.layer_norm = nn.LayerNorm(embed_dim)
         self.pointwise_conv1 = torch.nn.Conv1d(
             embed_dim,
             2 * channels,
