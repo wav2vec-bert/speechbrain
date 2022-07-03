@@ -6,56 +6,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+from fairseq.data.data_utils import compute_mask_indices
 
+
+# default conv block params
 FEATURE_ENC_LAYERS: List[Tuple[int, int, int]] = (
     [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] + [(512, 2, 2)]
 )
 
-from fairseq.data.data_utils import compute_mask_indices
-
 # based on https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/wav2vec/wav2vec2.py
-
-def is_xla_tensor(tensor):
-    return torch.is_tensor(tensor) and tensor.device.type == "xla"
-
-
-def index_put(tensor, indices, value):
-    if is_xla_tensor(tensor):
-        for _ in range(indices.dim(), tensor.dim()):
-            indices = indices.unsqueeze(-1)
-        if indices.size(-1) < tensor.size(-1):
-            indices = indices.expand_as(tensor)
-        tensor = torch.mul(tensor, ~indices) + torch.mul(value, indices)
-    else:
-        tensor[indices] = value
-    return tensor
-
-
-def buffered_arange(max):
-    if not hasattr(buffered_arange, "buf"):
-        buffered_arange.buf = torch.LongTensor()
-    if max > buffered_arange.buf.numel():
-        buffered_arange.buf.resize_(max)
-        torch.arange(max, out=buffered_arange.buf)
-    return buffered_arange.buf[:max]
-
-
-def pad_to_multiple(x, multiple, dim=-1, value=0):
-    # Inspired from https://github.com/lucidrains/local-attention/blob/master/local_attention/local_attention.py#L41
-    if x is None:
-        return None, 0
-    tsz = x.size(dim)
-    m = tsz / multiple
-    remainder = math.ceil(m) * multiple - tsz
-    if m.is_integer():
-        return x, 0
-    pad_offset = (0,) * (-1 - dim) * 2
-
-    return F.pad(x, (*pad_offset, 0, remainder), value=value), remainder
 
 
 class Wav2Vec2(nn.Module):
-    """"""
+    """
+    ASR Model of wav2vec
+    """
 
     def __init__(
         self,
@@ -66,8 +31,6 @@ class Wav2Vec2(nn.Module):
         mask_prob = 0.65, # probability of replacing a token with mask (supposed to use in pretraining)
     ):
         super().__init__()
-        ...
-
 
         # get the dim of output conv layer 1st block
         self.embed = feature_enc_layers[-1][0]
@@ -85,7 +48,6 @@ class Wav2Vec2(nn.Module):
             conv_bias=self.conv_bias,
         )
 
-
         # adding linear layer if not same dimension from dim output ConvFeatureExtractionModel and dimm encoder 
         self.post_extract_proj = (
              nn.Linear(self.embed, self.encoder_embed_dim)
@@ -93,10 +55,8 @@ class Wav2Vec2(nn.Module):
              else None
          )
 
-
-        self.mask_prob = mask_prob
-
         # params for compute_mask_indices
+        self.mask_prob = mask_prob # # probability of replacing a feature with 0
         self.mask_selection = 'static' # how to choose mask length 
         self.mask_other =  0.0 # secondary mask argument (used for more complex distributions)
         self.mask_length = 10 
@@ -112,6 +72,7 @@ class Wav2Vec2(nn.Module):
         self.no_mask_channel_overlap = False # whether to allow channel masks to overlap
         self.mask_channel_min_space = 1 # min space between spans (if no overlap is enabled)
 
+        # definition of dropouts 'layers'
         self.dropout_input = nn.Dropout(0.0) # dropout to apply to the input (after feat extr)
         self.dropout_features = nn.Dropout(0.0) # dropout to apply to the features (after feat extr)
 
@@ -259,20 +220,25 @@ class Wav2Vec2(nn.Module):
         # return x, mask_indices
 
     def sample_negatives(self, y, num, padding_count=None):
+        """
+        negative sampling allows reduce the cost of process predicting the results
+        """
 
+        # if no number of negative sample selected, return default y output
         if self.n_negatives == 0 and self.cross_sample_negatives == 0:
             return y.new(0)
 
-        bsz, tsz, fsz = y.shape
+        bsz, tsz, fsz = y.shape  # batch_size, number_of_tokens, dim_token
         y = y.view(-1, fsz)  # BTC => (BxT)C
 
-        # FIXME: what happens if padding_count is specified?
         cross_high = tsz * bsz
         high = tsz - (padding_count or 0)
         with torch.no_grad():
             assert high > 1, f"{bsz,tsz,fsz}"
 
             if self.n_negatives > 0:
+
+                # creation of tensor range from 0 to max with step 1 repeated on last dimenstion [0 ,1 ,2 , .. max ] => [0,0,1,1,2,2,...,max,max]
                 tszs = (
                     buffered_arange(num)
                     .unsqueeze(-1)
@@ -280,6 +246,7 @@ class Wav2Vec2(nn.Module):
                     .flatten()
                 )
 
+                # random integers between 0 and high -1
                 neg_idxs = torch.randint(
                     low=0, high=high - 1, size=(bsz, self.n_negatives * num)
                 )
@@ -1874,3 +1841,42 @@ class Fp32GroupNorm(nn.GroupNorm):
             self.eps,
         )
         return output.type_as(input)
+
+
+
+def index_put(tensor, indices, value):
+    if is_xla_tensor(tensor):
+        for _ in range(indices.dim(), tensor.dim()):
+            indices = indices.unsqueeze(-1)
+        if indices.size(-1) < tensor.size(-1):
+            indices = indices.expand_as(tensor)
+        tensor = torch.mul(tensor, ~indices) + torch.mul(value, indices)
+    else:
+        tensor[indices] = value
+    return tensor
+
+
+def buffered_arange(max):
+    if not hasattr(buffered_arange, "buf"):
+        buffered_arange.buf = torch.LongTensor()
+    if max > buffered_arange.buf.numel():
+        buffered_arange.buf.resize_(max)
+        torch.arange(max, out=buffered_arange.buf)
+    return buffered_arange.buf[:max]
+
+
+def pad_to_multiple(x, multiple, dim=-1, value=0):
+    # Inspired from https://github.com/lucidrains/local-attention/blob/master/local_attention/local_attention.py#L41
+    if x is None:
+        return None, 0
+    tsz = x.size(dim)
+    m = tsz / multiple
+    remainder = math.ceil(m) * multiple - tsz
+    if m.is_integer():
+        return x, 0
+    pad_offset = (0,) * (-1 - dim) * 2
+
+    return F.pad(x, (*pad_offset, 0, remainder), value=value), re
+    
+def is_xla_tensor(tensor):
+    return torch.is_tensor(tensor) and tensor.device.type == "xla"
