@@ -27,8 +27,8 @@ class Wav2Vec2(nn.Module):
         feature_enc_layers: List[Tuple[int, int, int]] = FEATURE_ENC_LAYERS,
         conv_bias: bool = False,
         dropout: float = 0.0,
-        encoder_embed_dim = 768,
-        mask_prob = 0.65, # probability of replacing a token with mask (supposed to use in pretraining)
+        encoder_embed_dim=768,
+        mask_prob=0.65,  # probability of replacing a token with mask (supposed to use in pretraining)
     ):
         super().__init__()
 
@@ -48,43 +48,69 @@ class Wav2Vec2(nn.Module):
             conv_bias=self.conv_bias,
         )
 
-        self.quantize_input = True 
+        self.quantize_input = True
 
-        # adding linear layer if not same dimension from dim output ConvFeatureExtractionModel and dimm encoder 
+        # adding linear layer if not same dimension from dim output ConvFeatureExtractionModel and dimm encoder
         self.post_extract_proj = (
-             nn.Linear(self.embed, self.encoder_embed_dim)
-             if self.embed != self.encoder_embed_dim and not self.quantize_input
-             else None
-         )
+            nn.Linear(self.embed, self.encoder_embed_dim)
+            if self.embed != self.encoder_embed_dim and not self.quantize_input
+            else None
+        )
 
         # params for compute_mask_indices
-        self.mask_prob = mask_prob # # probability of replacing a feature with 0
-        self.mask_selection = 'static' # how to choose mask length 
-        self.mask_other =  0.0 # secondary mask argument (used for more complex distributions)
-        self.mask_length = 10 
-        self.no_mask_overlap =  False # whether to allow masks to overlap
-        self.mask_min_space = 1 # min space between spans (if no overlap is enabled)
+        self.mask_prob = (
+            mask_prob  # # probability of replacing a feature with 0
+        )
+        self.mask_selection = "static"  # how to choose mask length
+        self.mask_other = 0.0  # secondary mask argument (used for more complex distributions)
+        self.mask_length = 10
+        self.no_mask_overlap = False  # whether to allow masks to overlap
+        self.mask_min_space = (
+            1  # min space between spans (if no overlap is enabled)
+        )
 
         # params for compute mask channel indices
-        self.mask_channel_prob = 0.0 # probability of replacing a feature with 0
+        self.mask_channel_prob = (
+            0.0  # probability of replacing a feature with 0
+        )
         self.mask_channel_before = False
-        self.mask_channel_selection = 'static' # how to choose mask length for channel masking
-        self.mask_channel_other = 0 # secondary mask argument (used for more complex distributions)
-        self.mask_channel_length = 10 # length of the mask for features (channels)
-        self.no_mask_channel_overlap = False # whether to allow channel masks to overlap
-        self.mask_channel_min_space = 1 # min space between spans (if no overlap is enabled)
+        self.mask_channel_selection = (
+            "static"  # how to choose mask length for channel masking
+        )
+        self.mask_channel_other = (
+            0  # secondary mask argument (used for more complex distributions)
+        )
+        self.mask_channel_length = (
+            10  # length of the mask for features (channels)
+        )
+        self.no_mask_channel_overlap = (
+            False  # whether to allow channel masks to overlap
+        )
+        self.mask_channel_min_space = (
+            1  # min space between spans (if no overlap is enabled)
+        )
 
         # definition of dropouts 'layers'
-        self.dropout_input = nn.Dropout(0.0) # dropout to apply to the input (after feat extr)
-        self.dropout_features = nn.Dropout(0.0) # dropout to apply to the features (after feat extr)
+        self.dropout_input = nn.Dropout(
+            0.0
+        )  # dropout to apply to the input (after feat extr)
+        self.dropout_features = nn.Dropout(
+            0.0
+        )  # dropout to apply to the features (after feat extr)
 
-        self.feature_grad_mult =  1.0 # multiply feature extractor var grads by this
+        self.feature_grad_mult = (
+            1.0  # multiply feature extractor var grads by this
+        )
 
         self.quantizer = None
         self.input_quantizer = None
 
-        self.n_negatives = 100 # number of negative examples from the same sample
-        self.cross_sample_negatives = 0 # number of negative examples from the samples
+        self.n_negatives = (
+            100  # number of negative examples from the same sample
+        )
+        self.cross_sample_negatives = (
+            0  # number of negative examples from the samples
+        )
         # self.codebook_negatives = cfg.codebook_negatives
         # self.negatives_from_everywhere = cfg.negatives_from_everywhere
 
@@ -156,7 +182,11 @@ class Wav2Vec2(nn.Module):
         # self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
 
     def apply_mask(
-        self, x, padding_mask, mask_indices=None, mask_channel_indices=None,
+        self,
+        x,
+        padding_mask,
+        mask_indices=None,
+        mask_channel_indices=None,
     ):
         B, T, C = x.shape
 
@@ -309,7 +339,9 @@ class Wav2Vec2(nn.Module):
 
         return logits
 
-    def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
+    def _get_feat_extract_output_lengths(
+        self, input_lengths: torch.LongTensor
+    ):
         """
         Computes the output length of the convolutional layers
         """
@@ -570,30 +602,42 @@ class Wav2Vec2(nn.Module):
 class ConvFeatureExtractionModel(nn.Module):
     def __init__(
         self,
-        conv_layers: List[Tuple[int, int, int]], # [[dim, k , stride], ... ]
+        conv_layers: List[Tuple[int, int, int]],  # [[dim, k , stride], ... ]
         dropout: float = 0.0,
-        conv_bias: bool = False
-        ):
+        conv_bias: bool = False,
+    ):
         super().__init__()
 
         # creation of conv blocks
-        in_d = 1 # dim input 
-        self.conv_layers = nn.ModuleList() # list of conv blocks
+        in_d = 1  # dim input
+        self.conv_layers = nn.ModuleList()  # list of conv blocks
         for i, conv_layer_params in enumerate(conv_layers):
             (dim, k, stride) = conv_layer_params
-            conv_layer = nn.Conv1d(in_d, dim, k, stride=stride, bias=conv_bias) # conv layer
-            nn.init.kaiming_normal_(conv_layer.weight) # intialisation of conv layer weights
-            if i == 0: # group norm for 1st conv block
-                conv_block =nn.Sequential(conv_layer,nn.Dropout(p=dropout),Fp32GroupNorm(dim, dim, affine=True),nn.GELU())
-            else: # clasical conv block for others
-                conv_block = nn.Sequential(conv_layer, nn.Dropout(p=dropout), nn.GELU())
+            conv_layer = nn.Conv1d(
+                in_d, dim, k, stride=stride, bias=conv_bias
+            )  # conv layer
+            nn.init.kaiming_normal_(
+                conv_layer.weight
+            )  # intialisation of conv layer weights
+            if i == 0:  # group norm for 1st conv block
+                conv_block = nn.Sequential(
+                    conv_layer,
+                    nn.Dropout(p=dropout),
+                    Fp32GroupNorm(dim, dim, affine=True),
+                    nn.GELU(),
+                )
+            else:  # clasical conv block for others
+                conv_block = nn.Sequential(
+                    conv_layer, nn.Dropout(p=dropout), nn.GELU()
+                )
             self.conv_layers.append(conv_block)
-            in_d = dim # new input dim for next block
-
+            in_d = dim  # new input dim for next block
 
     def forward(self, x):
 
-        x = x.unsqueeze(1) # Returns a new tensor with a dimension of size one inserted at the specified position.
+        x = x.unsqueeze(
+            1
+        )  # Returns a new tensor with a dimension of size one inserted at the specified position.
 
         for conv in self.conv_layers:
             x = conv(x)
@@ -602,7 +646,13 @@ class ConvFeatureExtractionModel(nn.Module):
 
 
 def make_conv_pos(e, k, g):
-    pos_conv = nn.Conv1d(e, e, kernel_size=k, padding=k // 2, groups=g,)
+    pos_conv = nn.Conv1d(
+        e,
+        e,
+        kernel_size=k,
+        padding=k // 2,
+        groups=g,
+    )
     dropout = 0
     std = math.sqrt((4 * (1.0 - dropout)) / (k * e))
     nn.init.normal_(pos_conv.weight, mean=0, std=std)
@@ -699,7 +749,11 @@ class TransformerEncoder(nn.Module):
                     *[
                         nn.Sequential(
                             nn.Conv1d(
-                                e, e, kernel_size=k, padding=k // 2, groups=g,
+                                e,
+                                e,
+                                kernel_size=k,
+                                padding=k // 2,
+                                groups=g,
                             ),
                             SamePad(k),
                             TransposeLast(),
@@ -717,7 +771,9 @@ class TransformerEncoder(nn.Module):
 
         else:
             self.pos_conv = make_conv_pos(
-                self.embedding_dim, conv_pos, conv_pos_groups,
+                self.embedding_dim,
+                conv_pos,
+                conv_pos_groups,
             )
 
         self.layers = nn.ModuleList(
@@ -737,7 +793,11 @@ class TransformerEncoder(nn.Module):
         return x, layer_results
 
     def extract_features(
-        self, x, padding_mask=None, tgt_layer=None, min_layer=0,
+        self,
+        x,
+        padding_mask=None,
+        tgt_layer=None,
+        min_layer=0,
     ):
 
         # TODO need to implement index_put
@@ -756,7 +816,9 @@ class TransformerEncoder(nn.Module):
             x, self.required_seq_len_multiple, dim=-2, value=0
         )
         if pad_length > 0 and padding_mask is None:
-            padding_mask = x.new_zeros((x.size(0), x.size(1)), dtype=torch.bool)
+            padding_mask = x.new_zeros(
+                (x.size(0), x.size(1)), dtype=torch.bool
+            )
             padding_mask[:, -pad_length:] = True
         else:
             padding_mask, _ = pad_to_multiple(
@@ -922,8 +984,8 @@ class TransformerSentenceEncoderLayer(nn.Module):
         attention_dropout: float = 0.1,
         activation_dropout: float = 0.1,
         activation_fn: str = "relu",
-        layer_norm_first: bool = False
-     ) -> None:
+        layer_norm_first: bool = False,
+    ) -> None:
 
         super().__init__()
         # # Initialize parameters
@@ -933,12 +995,10 @@ class TransformerSentenceEncoderLayer(nn.Module):
 
         # # Initialize blocks
         self.activation_fn = get_activation_fn(activation_fn)
-        
-        
 
-        self.self_attn = nn.MultiheadAttention(self.embedding_dim,
-             num_attention_heads,
-             dropout=attention_dropout)
+        self.self_attn = nn.MultiheadAttention(
+            self.embedding_dim, num_attention_heads, dropout=attention_dropout
+        )
         # # old deinfition of multiheadattention (from fairseq)
         # self.self_attn = MultiheadAttention(
         #    self.embedding_dim,
@@ -1280,7 +1340,9 @@ def _checkpointed_forward(original_forward, offload_to_cpu, *args, **kwargs):
     if isinstance(output, torch.Tensor):
         return output
     else:
-        packed_non_tensor_outputs = parent_ctx_dict["packed_non_tensor_outputs"]
+        packed_non_tensor_outputs = parent_ctx_dict[
+            "packed_non_tensor_outputs"
+        ]
         if packed_non_tensor_outputs:
             output = unpack_non_tensors(output, packed_non_tensor_outputs)
         return output
@@ -1338,7 +1400,8 @@ def split_non_tensors(
 
 
 def unpack_non_tensors(
-    tensors: Tuple[torch.Tensor], packed_non_tensors: Dict[str, List[Any]],
+    tensors: Tuple[torch.Tensor],
+    packed_non_tensors: Dict[str, List[Any]],
 ) -> Tuple[Any]:
     if packed_non_tensors is None:
         return tensors
@@ -1438,7 +1501,9 @@ class CheckpointFunction(torch.autograd.Function):
             ]
             for i, need_grad in enumerate(ctx.grad_requirements):
                 tensor_inputs[i].requires_grad = need_grad
-        inputs = unpack_non_tensors(tensor_inputs, ctx.packed_non_tensor_inputs)
+        inputs = unpack_non_tensors(
+            tensor_inputs, ctx.packed_non_tensor_inputs
+        )
 
         # Store the current states.
         bwd_rng_state = get_rng_state()
@@ -1477,17 +1542,6 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None, None) + grads
 
 
-
-
-
-
-
-
-
-
-
-
-
 def get_activation_fn(activation: str):
     """Returns the activation function corresponding to `activation`"""
     from fairseq.modules import gelu, gelu_accurate
@@ -1507,45 +1561,37 @@ def get_activation_fn(activation: str):
     elif activation == "swish":
         return torch.nn.SiLU
     else:
-        raise RuntimeError("--activation-fn {} not supported".format(activation))
-
+        raise RuntimeError(
+            "--activation-fn {} not supported".format(activation)
+        )
 
 
 def gelu_accurate(x):
     if not hasattr(gelu_accurate, "_a"):
         gelu_accurate._a = math.sqrt(2 / math.pi)
     return (
-        0.5 * x * (1 + torch.tanh(gelu_accurate._a * (x + 0.044715 * torch.pow(x, 3))))
+        0.5
+        * x
+        * (1 + torch.tanh(gelu_accurate._a * (x + 0.044715 * torch.pow(x, 3))))
     )
+
 
 def relu_squared(x: torch.Tensor):
     return F.relu(x).pow(2)
+
 
 def gelu(x: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.gelu(x.float()).type_as(x)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-#from typing import Optional
-#from fairseq.modules import (
+# from typing import Optional
+# from fairseq.modules import (
 #
 #    ESPNETMultiHeadedAttention,
 #    RelPositionMultiHeadedAttention,
 #    RotaryPositionMultiHeadedAttention,
-#)
-#from fairseq.utils import get_activation_fn
+# )
+# from fairseq.utils import get_activation_fn
 
 
 class ConvolutionModule(torch.nn.Module):
@@ -1654,7 +1700,7 @@ class FeedForwardModule(torch.nn.Module):
         """
 
         super(FeedForwardModule, self).__init__()
-        self.layer_norm = nn,LayerNorm(input_feat)
+        self.layer_norm = nn, LayerNorm(input_feat)
         self.w_1 = torch.nn.Linear(input_feat, hidden_units, bias=bias)
         self.w_2 = torch.nn.Linear(hidden_units, input_feat, bias=bias)
         self.dropout1 = torch.nn.Dropout(dropout1)
@@ -1723,7 +1769,10 @@ class ConformerEncoderLayer(nn.Module):
                 )
             elif self.pos_enc_type == "rope":
                 self.self_attn = RotaryPositionMultiHeadedAttention(
-                    embed_dim, attention_heads, dropout=dropout, precision=use_fp16
+                    embed_dim,
+                    attention_heads,
+                    dropout=dropout,
+                    precision=use_fp16,
                 )
             elif self.pos_enc_type == "abs":
                 self.self_attn = ESPNETMultiHeadedAttention(
@@ -1732,7 +1781,9 @@ class ConformerEncoderLayer(nn.Module):
                     dropout=dropout,
                 )
             else:
-                raise Exception(f"Unsupported attention type {self.pos_enc_type}")
+                raise Exception(
+                    f"Unsupported attention type {self.pos_enc_type}"
+                )
         else:
             # Default to fairseq MHA
             self.self_attn = nn.MultiheadAttention(
@@ -1762,7 +1813,7 @@ class ConformerEncoderLayer(nn.Module):
         self,
         x,
         encoder_padding_mask,
-        position_emb = None,
+        position_emb=None,
     ):
         """
         Args:
@@ -1831,7 +1882,6 @@ class ConformerWav2Vec2EncoderLayer(ConformerEncoderLayer):
         return super().forward(x, self_attn_padding_mask, position_emb)
 
 
-
 class Fp32GroupNorm(nn.GroupNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1845,7 +1895,6 @@ class Fp32GroupNorm(nn.GroupNorm):
             self.eps,
         )
         return output.type_as(input)
-
 
 
 def index_put(tensor, indices, value):
@@ -1881,6 +1930,7 @@ def pad_to_multiple(x, multiple, dim=-1, value=0):
     pad_offset = (0,) * (-1 - dim) * 2
 
     return F.pad(x, (*pad_offset, 0, remainder), value=value), re
-    
+
+
 def is_xla_tensor(tensor):
     return torch.is_tensor(tensor) and tensor.device.type == "xla"
