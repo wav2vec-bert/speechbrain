@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from fairseq.data.data_utils import compute_mask_indices
+
+# from fairseq.data.data_utils import compute_mask_indices
 
 
 # default conv block params
@@ -62,7 +63,9 @@ class Wav2Vec2(nn.Module):
             mask_prob  # # probability of replacing a feature with 0
         )
         self.mask_selection = "static"  # how to choose mask length
-        self.mask_other = 0.0  # secondary mask argument (used for more complex distributions)
+        self.mask_other = (
+            0.0  # secondary mask argument (used for more complex distributions)
+        )
         self.mask_length = 10
         self.no_mask_overlap = False  # whether to allow masks to overlap
         self.mask_min_space = (
@@ -182,11 +185,7 @@ class Wav2Vec2(nn.Module):
         # self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
 
     def apply_mask(
-        self,
-        x,
-        padding_mask,
-        mask_indices=None,
-        mask_channel_indices=None,
+        self, x, padding_mask, mask_indices=None, mask_channel_indices=None,
     ):
         B, T, C = x.shape
 
@@ -339,9 +338,7 @@ class Wav2Vec2(nn.Module):
 
         return logits
 
-    def _get_feat_extract_output_lengths(
-        self, input_lengths: torch.LongTensor
-    ):
+    def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """
         Computes the output length of the convolutional layers
         """
@@ -476,9 +473,7 @@ class Wav2Vec2(nn.Module):
                 y = self.project_q(y)
 
                 negs, _ = self.sample_negatives(
-                    y,
-                    mask_indices[0].sum(),
-                    padding_count=padding_count,
+                    y, mask_indices[0].sum(), padding_count=padding_count,
                 )
                 y = y[mask_indices].view(y.size(0), -1, y.size(-1))
 
@@ -493,9 +488,7 @@ class Wav2Vec2(nn.Module):
                 y = self.project_q(y)
 
                 negs, _ = self.sample_negatives(
-                    y,
-                    y.size(1),
-                    padding_count=padding_count,
+                    y, y.size(1), padding_count=padding_count,
                 )
 
             if self.codebook_negatives > 0:
@@ -512,16 +505,12 @@ class Wav2Vec2(nn.Module):
 
             if self.negatives_from_everywhere:
                 negs, _ = self.sample_negatives(
-                    unmasked_features,
-                    y.size(1),
-                    padding_count=padding_count,
+                    unmasked_features, y.size(1), padding_count=padding_count,
                 )
                 negs = self.project_q(negs)
             else:
                 negs, _ = self.sample_negatives(
-                    y,
-                    y.size(1),
-                    padding_count=padding_count,
+                    y, y.size(1), padding_count=padding_count,
                 )
 
         if not is_xla_tensor(x):
@@ -646,13 +635,7 @@ class ConvFeatureExtractionModel(nn.Module):
 
 
 def make_conv_pos(e, k, g):
-    pos_conv = nn.Conv1d(
-        e,
-        e,
-        kernel_size=k,
-        padding=k // 2,
-        groups=g,
-    )
+    pos_conv = nn.Conv1d(e, e, kernel_size=k, padding=k // 2, groups=g,)
     dropout = 0
     std = math.sqrt((4 * (1.0 - dropout)) / (k * e))
     nn.init.normal_(pos_conv.weight, mean=0, std=std)
@@ -704,18 +687,17 @@ class TransformerEncoder(nn.Module):
                 layer_norm_first=self.layer_norm_first,
             )
         elif self.layer_type == "conformer":
-            ...
-            # layer = ConformerWav2Vec2EncoderLayer(
-            #     embed_dim=self.embedding_dim,
-            #     ffn_embed_dim=args.encoder_ffn_embed_dim,
-            #     attention_heads=args.encoder_attention_heads,
-            #     dropout=args.dropout,
-            #     depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
-            #     activation_fn="swish",
-            #     attn_type=args.attn_type,
-            #     use_fp16=args.fp16,
-            #     pos_enc_type="abs",
-            # )
+            layer = ConformerWav2Vec2EncoderLayer(
+                embed_dim=self.embedding_dim,
+                ffn_embed_dim=3072,
+                attention_heads=12,
+                dropout=self.dropout,
+                depthwise_conv_kernel_size=31,
+                activation_fn="swish",
+                attn_type="",
+                use_fp16=False,
+                pos_enc_type="abs",
+            )
         if self.checkpoint_activations:
             layer = checkpoint_wrapper(layer)
         return layer
@@ -749,11 +731,7 @@ class TransformerEncoder(nn.Module):
                     *[
                         nn.Sequential(
                             nn.Conv1d(
-                                e,
-                                e,
-                                kernel_size=k,
-                                padding=k // 2,
-                                groups=g,
+                                e, e, kernel_size=k, padding=k // 2, groups=g,
                             ),
                             SamePad(k),
                             TransposeLast(),
@@ -771,9 +749,7 @@ class TransformerEncoder(nn.Module):
 
         else:
             self.pos_conv = make_conv_pos(
-                self.embedding_dim,
-                conv_pos,
-                conv_pos_groups,
+                self.embedding_dim, conv_pos, conv_pos_groups,
             )
 
         self.layers = nn.ModuleList(
@@ -793,11 +769,7 @@ class TransformerEncoder(nn.Module):
         return x, layer_results
 
     def extract_features(
-        self,
-        x,
-        padding_mask=None,
-        tgt_layer=None,
-        min_layer=0,
+        self, x, padding_mask=None, tgt_layer=None, min_layer=0,
     ):
 
         # TODO need to implement index_put
@@ -816,9 +788,7 @@ class TransformerEncoder(nn.Module):
             x, self.required_seq_len_multiple, dim=-2, value=0
         )
         if pad_length > 0 and padding_mask is None:
-            padding_mask = x.new_zeros(
-                (x.size(0), x.size(1)), dtype=torch.bool
-            )
+            padding_mask = x.new_zeros((x.size(0), x.size(1)), dtype=torch.bool)
             padding_mask[:, -pad_length:] = True
         else:
             padding_mask, _ = pad_to_multiple(
@@ -881,21 +851,20 @@ class TransformerEncoder(nn.Module):
 class ConformerEncoder(TransformerEncoder):
     def build_encoder_layer(self, args):
         ...
-        # layer = ConformerWav2Vec2EncoderLayer(
-        #     embed_dim=self.embedding_dim,
-        #     ffn_embed_dim=args.encoder_ffn_embed_dim,
-        #     attention_heads=args.encoder_attention_heads,
-        #     dropout=args.dropout,
-        #     depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
-        #     activation_fn="swish",
-        #     attn_type=args.attn_type,
-        #     pos_enc_type=args.pos_enc_type,
-        #     use_fp16=args.fp16,  # only used for rope
-        # )
-        # layer = fsdp_wrap(layer)
-        # if args.checkpoint_activations:
-        #     layer = checkpoint_wrapper(layer)
-        # return layer
+        layer = ConformerWav2Vec2EncoderLayer(
+            embed_dim=self.embedding_dim,
+            ffn_embed_dim=args.encoder_ffn_embed_dim,
+            attention_heads=args.encoder_attention_heads,
+            dropout=args.dropout,
+            depthwise_conv_kernel_size=args.depthwise_conv_kernel_size,
+            activation_fn="swish",
+            attn_type=args.attn_type,
+            pos_enc_type=args.pos_enc_type,
+            use_fp16=args.fp16,  # only used for rope
+        )
+        if args.checkpoint_activations:
+            layer = checkpoint_wrapper(layer)
+        return layer
 
     def __init__(self, args):
         super().__init__(args)
@@ -1340,9 +1309,7 @@ def _checkpointed_forward(original_forward, offload_to_cpu, *args, **kwargs):
     if isinstance(output, torch.Tensor):
         return output
     else:
-        packed_non_tensor_outputs = parent_ctx_dict[
-            "packed_non_tensor_outputs"
-        ]
+        packed_non_tensor_outputs = parent_ctx_dict["packed_non_tensor_outputs"]
         if packed_non_tensor_outputs:
             output = unpack_non_tensors(output, packed_non_tensor_outputs)
         return output
@@ -1400,8 +1367,7 @@ def split_non_tensors(
 
 
 def unpack_non_tensors(
-    tensors: Tuple[torch.Tensor],
-    packed_non_tensors: Dict[str, List[Any]],
+    tensors: Tuple[torch.Tensor], packed_non_tensors: Dict[str, List[Any]],
 ) -> Tuple[Any]:
     if packed_non_tensors is None:
         return tensors
@@ -1501,9 +1467,7 @@ class CheckpointFunction(torch.autograd.Function):
             ]
             for i, need_grad in enumerate(ctx.grad_requirements):
                 tensor_inputs[i].requires_grad = need_grad
-        inputs = unpack_non_tensors(
-            tensor_inputs, ctx.packed_non_tensor_inputs
-        )
+        inputs = unpack_non_tensors(tensor_inputs, ctx.packed_non_tensor_inputs)
 
         # Store the current states.
         bwd_rng_state = get_rng_state()
@@ -1643,12 +1607,7 @@ class ConvolutionModule(torch.nn.Module):
         self.batch_norm = torch.nn.BatchNorm1d(channels)
         self.activation = get_activation_fn(activation_fn)(channels)
         self.pointwise_conv2 = torch.nn.Conv1d(
-            channels,
-            embed_dim,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=bias,
+            channels, embed_dim, kernel_size=1, stride=1, padding=0, bias=bias,
         )
         self.dropout = torch.nn.Dropout(dropout)
 
@@ -1700,7 +1659,7 @@ class FeedForwardModule(torch.nn.Module):
         """
 
         super(FeedForwardModule, self).__init__()
-        self.layer_norm = nn, LayerNorm(input_feat)
+        self.layer_norm = nn.module.LayerNorm(input_feat)
         self.w_1 = torch.nn.Linear(input_feat, hidden_units, bias=bias)
         self.w_2 = torch.nn.Linear(hidden_units, input_feat, bias=bias)
         self.dropout1 = torch.nn.Dropout(dropout1)
@@ -1752,45 +1711,36 @@ class ConformerEncoderLayer(nn.Module):
         super(ConformerEncoderLayer, self).__init__()
 
         self.ffn1 = FeedForwardModule(
-            embed_dim,
-            ffn_embed_dim,
-            dropout,
-            dropout,
+            embed_dim, ffn_embed_dim, dropout, dropout,
         )
 
         self.self_attn_layer_norm = nn.LayerNorm(embed_dim, export=False)
         self.self_attn_dropout = torch.nn.Dropout(dropout)
-        if attn_type == "espnet":
-            if self.pos_enc_type == "rel_pos":
-                self.self_attn = RelPositionMultiHeadedAttention(
-                    embed_dim,
-                    attention_heads,
-                    dropout=dropout,
-                )
-            elif self.pos_enc_type == "rope":
-                self.self_attn = RotaryPositionMultiHeadedAttention(
-                    embed_dim,
-                    attention_heads,
-                    dropout=dropout,
-                    precision=use_fp16,
-                )
-            elif self.pos_enc_type == "abs":
-                self.self_attn = ESPNETMultiHeadedAttention(
-                    embed_dim,
-                    attention_heads,
-                    dropout=dropout,
-                )
-            else:
-                raise Exception(
-                    f"Unsupported attention type {self.pos_enc_type}"
-                )
-        else:
-            # Default to fairseq MHA
-            self.self_attn = nn.MultiheadAttention(
-                embed_dim,
-                attention_heads,
-                dropout=dropout,
-            )
+        # if attn_type == "espnet":
+        #    if self.pos_enc_type == "rel_pos":
+        #        self.self_attn = RelPositionMultiHeadedAttention(
+        #            embed_dim, attention_heads, dropout=dropout,
+        #        )
+        #    elif self.pos_enc_type == "rope":
+        #        self.self_attn = RotaryPositionMultiHeadedAttention(
+        #            embed_dim,
+        #            attention_heads,
+        #            dropout=dropout,
+        #            precision=use_fp16,
+        #        )
+        #    elif self.pos_enc_type == "abs":
+        #        self.self_attn = ESPNETMultiHeadedAttention(
+        #            embed_dim, attention_heads, dropout=dropout,
+        #        )
+        #    else:
+        #        raise Exception(
+        #            f"Unsupported attention type {self.pos_enc_type}"
+        #        )
+        # else:
+        # Default to fairseq MHA
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim, attention_heads, dropout=dropout,
+        )
 
         self.conv_module = ConvolutionModule(
             embed_dim=embed_dim,
@@ -1810,10 +1760,7 @@ class ConformerEncoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(
-        self,
-        x,
-        encoder_padding_mask,
-        position_emb=None,
+        self, x, encoder_padding_mask, position_emb=None,
     ):
         """
         Args:
@@ -1929,8 +1876,20 @@ def pad_to_multiple(x, multiple, dim=-1, value=0):
         return x, 0
     pad_offset = (0,) * (-1 - dim) * 2
 
-    return F.pad(x, (*pad_offset, 0, remainder), value=value), re
+    return F.pad(x, (*pad_offset, 0, remainder), value=value), remainder
 
 
 def is_xla_tensor(tensor):
     return torch.is_tensor(tensor) and tensor.device.type == "xla"
+
+
+class GradMultiply(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        res = x.new(x)
+        return res
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
